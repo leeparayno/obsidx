@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use pulldown_cmark::{Event, Parser as MdParser, Tag, TagEnd};
 use regex::Regex;
 use notify::{RecursiveMode, Watcher, Config};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde_json::json;
 use tantivy::collector::TopDocs;
@@ -100,6 +101,45 @@ enum Commands {
         #[arg(long, default_value_t = 500)]
         debounce_ms: u64,
     },
+    /// Build embeddings index (SQLite)
+    EmbedIndex {
+        #[arg(long)]
+        vault: String,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
+        #[arg(long, default_value_t = 1500)]
+        max_chars: usize,
+        #[arg(long, default_value_t = 200)]
+        overlap: usize,
+    },
+    /// Vector search over embeddings
+    EmbedSearch {
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Hybrid search (BM25 + Vector) with RRF
+    Hybrid {
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 60)]
+        rrf_k: u32,
+        #[arg(long, default_value_t = 50)]
+        bm25_limit: usize,
+        #[arg(long, default_value_t = 50)]
+        vec_limit: usize,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Index stats
     Stats {
         #[arg(long, default_value = "./.obsidx")]
@@ -182,6 +222,9 @@ fn main() -> Result<()> {
         Commands::Links { from, index, json } => list_links(&index, &from, json),
         Commands::Backlinks { to, index, json } => list_backlinks(&index, &to, json),
         Commands::Watch { vault, index, debounce_ms } => watch_vault(&vault, &index, debounce_ms),
+        Commands::EmbedIndex { vault, index, max_chars, overlap } => embed_index(&vault, &index, max_chars, overlap),
+        Commands::EmbedSearch { query, index, limit, json } => embed_search(&index, &query, limit, json),
+        Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json),
         Commands::Stats { index, json } => stats(&index, json),
         Commands::Schema { pretty } => print_schema(pretty),
         Commands::ToolSpec { pretty } => print_tool_spec(pretty),
@@ -592,6 +635,220 @@ fn watch_vault(vault: &str, index_dir: &str, debounce_ms: u64) -> Result<()> {
         // incremental rebuild
         let _ = build_index(vault, index_dir, true);
     }
+}
+
+
+#[derive(Debug, Serialize)]
+struct VectorResult {
+    path: String,
+    score: f32,
+    chunk: String,
+}
+
+fn embed_index(vault: &str, index_dir: &str, max_chars: usize, overlap: usize) -> Result<()> {
+    fs::create_dir_all(index_dir).ok();
+    let db_path = Path::new(index_dir).join("embeddings.db");
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS chunks (            id INTEGER PRIMARY KEY,            path TEXT,            chunk TEXT,            mtime INTEGER,            embedding TEXT        );",
+    )?;
+
+    // Full rebuild for now
+    conn.execute("DELETE FROM chunks", [])?;
+
+    let docs = scan_vault(Path::new(vault))?;
+    let mut inserted = 0;
+    for doc in docs {
+        let chunks = chunk_text(&doc.content, max_chars, overlap);
+        for ch in chunks {
+            let emb = hash_embedding(&ch, 256);
+            let emb_json = serde_json::to_string(&emb).unwrap_or_else(|_| "[]".to_string());
+            conn.execute(
+                "INSERT INTO chunks (path, chunk, mtime, embedding) VALUES (?1, ?2, ?3, ?4)",
+                params![doc.path, ch, doc.mtime, emb_json],
+            )?;
+            inserted += 1;
+        }
+    }
+
+    let out = json_response(json!({
+        "message": "embeddings indexed (hash placeholder)",
+        "vault": vault,
+        "index": index_dir,
+        "chunks": inserted
+    }));
+    println!("{out}");
+    Ok(())
+}
+
+fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool) -> Result<()> {
+    let db_path = Path::new(index_dir).join("embeddings.db");
+    let conn = Connection::open(db_path)?;
+    let qemb = hash_embedding(query, 256);
+
+    let mut stmt = conn.prepare("SELECT path, chunk, embedding FROM chunks")?;
+    let rows = stmt.query_map([], |row| {
+        let path: String = row.get(0)?;
+        let chunk: String = row.get(1)?;
+        let emb_json: String = row.get(2)?;
+        let emb: Vec<f32> = serde_json::from_str(&emb_json).unwrap_or_default();
+        Ok((path, chunk, emb))
+    })?;
+
+    let mut results: Vec<VectorResult> = Vec::new();
+    for row in rows {
+        let (path, chunk, emb) = row?;
+        let score = cosine_sim(&qemb, &emb);
+        results.push(VectorResult { path, score, chunk });
+    }
+
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    results.truncate(limit);
+
+    if json_out {
+        let out = json_response(json!({ "query": query, "results": results }));
+        println!("{out}");
+    } else {
+        for r in results {
+            println!("{}	{:.3}	{}", r.path, r.score, r.chunk);
+        }
+    }
+    Ok(())
+}
+
+fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_limit: usize, vec_limit: usize, json_out: bool) -> Result<()> {
+    let bm25 = bm25_search(index_dir, query, bm25_limit)?;
+    let vec = embed_search_results(index_dir, query, vec_limit)?;
+
+    let mut scores: HashMap<String, f32> = HashMap::new();
+
+    for (rank, item) in bm25.iter().enumerate() {
+        let r = (rrf_k + (rank as u32) + 1) as f32;
+        *scores.entry(item.path.clone()).or_insert(0.0) += 1.0 / r;
+    }
+    for (rank, item) in vec.iter().enumerate() {
+        let r = (rrf_k + (rank as u32) + 1) as f32;
+        *scores.entry(item.path.clone()).or_insert(0.0) += 1.0 / r;
+    }
+
+    let mut fused: Vec<(String, f32)> = scores.into_iter().collect();
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    fused.truncate(limit);
+
+    if json_out {
+        let out = json_response(json!({ "query": query, "results": fused }));
+        println!("{out}");
+    } else {
+        for (path, score) in fused {
+            println!("{}	{:.4}", path, score);
+        }
+    }
+
+    Ok(())
+}
+
+fn bm25_search(index_dir: &str, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    let index = Index::open_in_dir(index_dir)
+        .with_context(|| format!("Index not found: {index_dir}"))?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+
+    let schema = index.schema();
+    let path_field = schema.get_field("path").unwrap();
+    let title_field = schema.get_field("title").unwrap();
+    let content_field = schema.get_field("content").unwrap();
+    let tags_field = schema.get_field("tags").unwrap();
+
+    let query_parser = QueryParser::for_index(&index, vec![title_field, content_field, tags_field]);
+    let q = query_parser.parse_query(query)?;
+    let top_docs = searcher.search(&q, &TopDocs::with_limit(limit))?;
+
+    let mut results = Vec::new();
+    for (score, doc_address) in top_docs {
+        let retrieved: TantivyDocument = searcher.doc(doc_address)?;
+        let path = retrieved
+            .get_first(path_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = retrieved
+            .get_first(title_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        results.push(SearchResult { path, title, score });
+    }
+    Ok(results)
+}
+
+fn embed_search_results(index_dir: &str, query: &str, limit: usize) -> Result<Vec<VectorResult>> {
+    let db_path = Path::new(index_dir).join("embeddings.db");
+    let conn = Connection::open(db_path)?;
+    let qemb = hash_embedding(query, 256);
+
+    let mut stmt = conn.prepare("SELECT path, chunk, embedding FROM chunks")?;
+    let rows = stmt.query_map([], |row| {
+        let path: String = row.get(0)?;
+        let chunk: String = row.get(1)?;
+        let emb_json: String = row.get(2)?;
+        let emb: Vec<f32> = serde_json::from_str(&emb_json).unwrap_or_default();
+        Ok((path, chunk, emb))
+    })?;
+
+    let mut results: Vec<VectorResult> = Vec::new();
+    for row in rows {
+        let (path, chunk, emb) = row?;
+        let score = cosine_sim(&qemb, &emb);
+        results.push(VectorResult { path, score, chunk });
+    }
+
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    results.truncate(limit);
+    Ok(results)
+}
+
+fn chunk_text(text: &str, max_chars: usize, overlap: usize) -> Vec<String> {
+    if text.len() <= max_chars {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let end = usize::min(start + max_chars, text.len());
+        let chunk = text[start..end].to_string();
+        chunks.push(chunk);
+        if end == text.len() { break; }
+        start = end.saturating_sub(overlap);
+    }
+    chunks
+}
+
+fn hash_embedding(text: &str, dims: usize) -> Vec<f32> {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    let mut vec = vec![0f32; dims];
+    for (i, ch) in text.chars().enumerate() {
+        let mut h = DefaultHasher::new();
+        ch.hash(&mut h);
+        let idx = (h.finish() as usize + i) % dims;
+        vec[idx] += 1.0;
+    }
+    let norm = (vec.iter().map(|v| v*v).sum::<f32>()).sqrt();
+    if norm > 0.0 {
+        for v in &mut vec { *v /= norm; }
+    }
+    vec
+}
+
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || b.is_empty() || a.len() != b.len() { return 0.0; }
+    let mut dot = 0.0; let mut na = 0.0; let mut nb = 0.0;
+    for i in 0..a.len() {
+        dot += a[i]*b[i];
+        na += a[i]*a[i];
+        nb += b[i]*b[i];
+    }
+    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na.sqrt()*nb.sqrt()) }
 }
 
 fn stats(index_dir: &str, json_out: bool) -> Result<()> {
