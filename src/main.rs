@@ -195,6 +195,7 @@ fn schema() -> Schema {
     schema_builder.add_text_field("content", TEXT);
     schema_builder.add_text_field("tags", TEXT | STORED);
     schema_builder.add_text_field("links", TEXT | STORED);
+    schema_builder.add_text_field("links_term", TEXT);
     schema_builder.add_text_field("headings", TEXT | STORED);
     schema_builder.add_text_field("frontmatter", TEXT | STORED);
     schema_builder.add_i64_field("mtime", FAST | STORED);
@@ -283,7 +284,7 @@ fn build_index(vault: &str, index_dir: &str, incremental: bool) -> Result<()> {
             writer.delete_term(term);
         }
 
-        writer.add_document(doc! {
+        let mut tdoc = doc! {
             fields.path => doc.path,
             fields.title => doc.title,
             fields.content => doc.content,
@@ -292,7 +293,11 @@ fn build_index(vault: &str, index_dir: &str, incremental: bool) -> Result<()> {
             fields.headings => serde_json::to_string(&doc.headings).unwrap_or_else(|_| "[]".to_string()),
             fields.frontmatter => doc.frontmatter_json,
             fields.mtime => doc.mtime,
-        })?;
+        };
+        for link in &doc.links {
+            tdoc.add_text(fields.links_term, link);
+        }
+        writer.add_document(tdoc)?;
     }
 
     writer.commit()?;
@@ -529,25 +534,22 @@ fn list_backlinks(index_dir: &str, to: &str, json_out: bool) -> Result<()> {
     let searcher = reader.searcher();
     let schema = index.schema();
     let path_field = schema.get_field("path").unwrap();
-    let links_field = schema.get_field("links").unwrap();
+    let links_term_field = schema.get_field("links_term").unwrap();
+
+    let term = Term::from_field_text(links_term_field, to);
+    let q = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+    let top_docs = searcher.search(&q, &TopDocs::with_limit(10_000))?;
 
     let mut results: Vec<String> = Vec::new();
-    for segment_reader in searcher.segment_readers() {
-        let store_reader = segment_reader.get_store_reader(0)?;
-        for doc_id in 0..segment_reader.max_doc() {
-            let doc: TantivyDocument = store_reader.get(doc_id)?;
-            let path = doc
-                .get_first(path_field)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if let Some(val) = doc.get_first(links_field).and_then(|v| v.as_str()) {
-                if let Ok(links) = serde_json::from_str::<Vec<String>>(val) {
-                    if links.iter().any(|l| l == to) {
-                        results.push(path);
-                    }
-                }
-            }
+    for (_score, doc_address) in top_docs {
+        let doc: TantivyDocument = searcher.doc(doc_address)?;
+        let path = doc
+            .get_first(path_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !path.is_empty() {
+            results.push(path);
         }
     }
 
@@ -615,6 +617,7 @@ struct SchemaFields {
     content: Field,
     tags: Field,
     links: Field,
+    links_term: Field,
     headings: Field,
     frontmatter: Field,
     mtime: Field,
@@ -628,6 +631,7 @@ fn schema_fields(index: &Index) -> SchemaFields {
         content: schema.get_field("content").unwrap(),
         tags: schema.get_field("tags").unwrap(),
         links: schema.get_field("links").unwrap(),
+        links_term: schema.get_field("links_term").unwrap(),
         headings: schema.get_field("headings").unwrap(),
         frontmatter: schema.get_field("frontmatter").unwrap(),
         mtime: schema.get_field("mtime").unwrap(),
