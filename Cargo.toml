@@ -15,4 +15,5 @@ pulldown-cmark = "0.12"
 tantivy = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
+notify = "6"
 

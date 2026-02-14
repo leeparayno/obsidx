@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::channel;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use pulldown_cmark::{Event, Parser as MdParser, Tag, TagEnd};
 use regex::Regex;
+use notify::{RecursiveMode, Watcher, Config};
 use serde::Serialize;
 use serde_json::json;
 use tantivy::collector::TopDocs;
@@ -78,6 +81,24 @@ enum Commands {
         index: String,
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    /// Backlinks to a note
+    Backlinks {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Watch vault and incrementally reindex
+    Watch {
+        #[arg(long)]
+        vault: String,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
+        #[arg(long, default_value_t = 500)]
+        debounce_ms: u64,
     },
     /// Index stats
     Stats {
@@ -159,6 +180,8 @@ fn main() -> Result<()> {
         } => get_note(&index, &path, json, content),
         Commands::Tags { index, json } => list_tags(&index, json),
         Commands::Links { from, index, json } => list_links(&index, &from, json),
+        Commands::Backlinks { to, index, json } => list_backlinks(&index, &to, json),
+        Commands::Watch { vault, index, debounce_ms } => watch_vault(&vault, &index, debounce_ms),
         Commands::Stats { index, json } => stats(&index, json),
         Commands::Schema { pretty } => print_schema(pretty),
         Commands::ToolSpec { pretty } => print_tool_spec(pretty),
@@ -388,20 +411,22 @@ fn get_note(index_dir: &str, path: &str, json_out: bool, include_content: bool) 
             "".to_string()
         };
 
+        let detail = NoteDetail {
+            path: path.to_string(),
+            title: title.to_string(),
+            content,
+            tags,
+            headings,
+            links,
+            frontmatter,
+            mtime,
+        };
+
         if json_out {
-            let out = json_response(json!({
-                "path": path,
-                "title": title,
-                "tags": tags,
-                "headings": headings,
-                "links": links,
-                "frontmatter": frontmatter,
-                "mtime": mtime,
-                "content": content
-            }));
+            let out = json_response(json!({ "note": detail }));
             println!("{out}");
         } else {
-            println!("{}\t{}", path, title);
+            println!("{}\t{}", detail.path, detail.title);
         }
     } else if json_out {
         let out = json_response(json!({
@@ -494,6 +519,77 @@ fn list_links(index_dir: &str, from: &str, json_out: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+
+fn list_backlinks(index_dir: &str, to: &str, json_out: bool) -> Result<()> {
+    let index = Index::open_in_dir(index_dir)
+        .with_context(|| format!("Index not found: {index_dir}"))?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let schema = index.schema();
+    let path_field = schema.get_field("path").unwrap();
+    let links_field = schema.get_field("links").unwrap();
+
+    let mut results: Vec<String> = Vec::new();
+    for segment_reader in searcher.segment_readers() {
+        let store_reader = segment_reader.get_store_reader(0)?;
+        for doc_id in 0..segment_reader.max_doc() {
+            let doc: TantivyDocument = store_reader.get(doc_id)?;
+            let path = doc
+                .get_first(path_field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(val) = doc.get_first(links_field).and_then(|v| v.as_str()) {
+                if let Ok(links) = serde_json::from_str::<Vec<String>>(val) {
+                    if links.iter().any(|l| l == to) {
+                        results.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    results.sort();
+    results.dedup();
+
+    if json_out {
+        let out = json_response(json!({ "to": to, "backlinks": results }));
+        println!("{out}");
+    } else {
+        for r in results {
+            println!("{r}");
+        }
+    }
+
+    Ok(())
+}
+
+fn watch_vault(vault: &str, index_dir: &str, debounce_ms: u64) -> Result<()> {
+    // Initial index
+    build_index(vault, index_dir, true)?;
+
+    let (tx, rx) = channel();
+    let mut watcher = notify::recommended_watcher(tx)?;
+    watcher.configure(Config::default().with_poll_interval(Duration::from_millis(250)))?;
+    watcher.watch(Path::new(vault), RecursiveMode::Recursive)?;
+
+    println!("Watching {} (index: {})", vault, index_dir);
+
+    loop {
+        // block until event
+        let _ = rx.recv();
+        // debounce: drain events for debounce_ms
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(debounce_ms) {
+            if rx.try_recv().is_err() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        // incremental rebuild
+        let _ = build_index(vault, index_dir, true);
+    }
 }
 
 fn stats(index_dir: &str, json_out: bool) -> Result<()> {
@@ -721,6 +817,7 @@ fn print_schema(pretty: bool) -> Result<()> {
             "get": {"data": {"path": "string", "title": "string", "tags": ["string"], "headings": ["string"], "links": ["string"], "frontmatter": "object", "mtime": "int", "content": "string"}},
             "tags": {"data": {"results": [{"tag": "string", "count": "int"}]}},
             "links": {"data": {"from": "string", "links": ["string"]}},
+            "backlinks": {"data": {"to": "string", "backlinks": ["string"]}},
             "stats": {"data": {"documents": "int"}},
             "init/index": {"data": {"message": "string", "vault": "string", "index": "string", "documents": "int"}}
         }
@@ -741,6 +838,8 @@ fn print_tool_spec(pretty: bool) -> Result<()> {
             {"name": "get", "args": "--index <path> --path <note.md> --json [--content]", "json": true},
             {"name": "tags", "args": "--index <path> --json", "json": true},
             {"name": "links", "args": "--index <path> --from <note.md> --json", "json": true},
+            {"name": "backlinks", "args": "--index <path> --to <note.md> --json", "json": true},
+            {"name": "watch", "args": "--vault <path> --index <path> --debounce-ms 500", "json": false},
             {"name": "stats", "args": "--index <path> --json", "json": true}
         ],
         "output_contract": "All --json commands return {version, timestamp, data} with stable schemas.",

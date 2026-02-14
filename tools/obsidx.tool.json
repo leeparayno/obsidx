@@ -1,0 +1,15 @@
+{
+  "name": "obsidx",
+  "description": "Local Obsidian vault indexer with JSON output. Composable CLI for LLM tools.",
+  "commands": {
+    "init": "obsidx init --vault <path> --index <path>",
+    "index": "obsidx index --vault <path> --index <path> [--incremental]",
+    "search": "obsidx search --index <path> --query <q> --limit 20 --json",
+    "get": "obsidx get --index <path> --path <note.md> --json [--content]",
+    "tags": "obsidx tags --index <path> --json",
+    "links": "obsidx links --index <path> --from <note.md> --json",
+    "backlinks": "obsidx backlinks --index <path> --to <note.md> --json",
+    "stats": "obsidx stats --index <path> --json",
+    "watch": "obsidx watch --vault <path> --index <path> --debounce-ms 500"
+  }
+}
