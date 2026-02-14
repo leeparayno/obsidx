@@ -59,6 +59,9 @@ enum Commands {
         index: String,
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Include content in response
+        #[arg(long, default_value_t = false)]
+        content: bool,
     },
     /// List tags
     Tags {
@@ -83,6 +86,16 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Output JSON schema for CLI responses
+    Schema {
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    /// Output tool spec for LLM integration
+    ToolSpec {
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +111,18 @@ struct TagCount {
     count: usize,
 }
 
+
+#[derive(Debug, Serialize)]
+struct NoteDetail {
+    path: String,
+    title: String,
+    content: String,
+    tags: Vec<String>,
+    headings: Vec<String>,
+    links: Vec<String>,
+    frontmatter: serde_json::Value,
+    mtime: i64,
+}
 #[derive(Debug)]
 struct NoteDoc {
     path: String,
@@ -126,10 +151,17 @@ fn main() -> Result<()> {
             limit,
             json,
         } => search_index(&index, &query, limit, json),
-        Commands::Get { path, index, json } => get_note(&index, &path, json),
+        Commands::Get {
+            path,
+            index,
+            json,
+            content,
+        } => get_note(&index, &path, json, content),
         Commands::Tags { index, json } => list_tags(&index, json),
         Commands::Links { from, index, json } => list_links(&index, &from, json),
         Commands::Stats { index, json } => stats(&index, json),
+        Commands::Schema { pretty } => print_schema(pretty),
+        Commands::ToolSpec { pretty } => print_tool_spec(pretty),
     }
 }
 
@@ -165,7 +197,7 @@ fn init_index(vault: &str, index_dir: &str) -> Result<()> {
     Ok(())
 }
 
-fn build_index(vault: &str, index_dir: &str, _incremental: bool) -> Result<()> {
+fn build_index(vault: &str, index_dir: &str, incremental: bool) -> Result<()> {
     let index_path = PathBuf::from(index_dir);
     if !index_path.exists() {
         fs::create_dir_all(&index_path)
@@ -181,14 +213,53 @@ fn build_index(vault: &str, index_dir: &str, _incremental: bool) -> Result<()> {
 
     let mut writer = index.writer(50_000_000)?;
 
-    // Full reindex for now.
-    writer.delete_all_documents()?;
+    if !incremental {
+        writer.delete_all_documents()?;
+    }
 
     let docs = scan_vault(Path::new(vault))?;
     let total_docs = docs.len();
     let fields = schema_fields(&index);
 
+    // Build a quick mtime map for incremental indexing
+    let mut existing_mtimes: HashMap<String, i64> = HashMap::new();
+    if incremental {
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let schema = index.schema();
+        let path_field = schema.get_field("path").unwrap();
+        let mtime_field = schema.get_field("mtime").unwrap();
+        for segment_reader in searcher.segment_readers() {
+            let store_reader = segment_reader.get_store_reader(0)?;
+            for doc_id in 0..segment_reader.max_doc() {
+                let doc: TantivyDocument = store_reader.get(doc_id)?;
+                let path = doc
+                    .get_first(path_field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mtime = doc
+                    .get_first(mtime_field)
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                if !path.is_empty() {
+                    existing_mtimes.insert(path, mtime);
+                }
+            }
+        }
+    }
+
     for doc in docs {
+        if incremental {
+            if let Some(old) = existing_mtimes.get(&doc.path) {
+                if *old >= doc.mtime {
+                    continue;
+                }
+            }
+            let term = Term::from_field_text(fields.path, &doc.path);
+            writer.delete_term(term);
+        }
+
         writer.add_document(doc! {
             fields.path => doc.path,
             fields.title => doc.title,
@@ -260,7 +331,7 @@ fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool) -> R
     Ok(())
 }
 
-fn get_note(index_dir: &str, path: &str, json_out: bool) -> Result<()> {
+fn get_note(index_dir: &str, path: &str, json_out: bool, include_content: bool) -> Result<()> {
     let index = Index::open_in_dir(index_dir)
         .with_context(|| format!("Index not found: {index_dir}"))?;
     let reader = index.reader()?;
@@ -284,10 +355,49 @@ fn get_note(index_dir: &str, path: &str, json_out: bool) -> Result<()> {
             .get_first(schema.get_field("title").unwrap())
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let tags = doc
+            .get_first(schema.get_field("tags").unwrap())
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .unwrap_or_default();
+        let headings = doc
+            .get_first(schema.get_field("headings").unwrap())
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .unwrap_or_default();
+        let links = doc
+            .get_first(schema.get_field("links").unwrap())
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .unwrap_or_default();
+        let frontmatter = doc
+            .get_first(schema.get_field("frontmatter").unwrap())
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .unwrap_or_else(|| json!({}));
+        let mtime = doc
+            .get_first(schema.get_field("mtime").unwrap())
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let content = if include_content {
+            doc.get_first(schema.get_field("content").unwrap())
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            "".to_string()
+        };
+
         if json_out {
             let out = json_response(json!({
                 "path": path,
-                "title": title
+                "title": title,
+                "tags": tags,
+                "headings": headings,
+                "links": links,
+                "frontmatter": frontmatter,
+                "mtime": mtime,
+                "content": content
             }));
             println!("{out}");
         } else {
@@ -596,4 +706,47 @@ fn json_response(payload: serde_json::Value) -> String {
         "data": payload
     });
     serde_json::to_string_pretty(&wrapper).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn print_schema(pretty: bool) -> Result<()> {
+    let schema = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "response": {
+            "version": "string",
+            "timestamp": "RFC3339 string",
+            "data": "object"
+        },
+        "commands": {
+            "search": {"data": {"query": "string", "results": [{"path": "string", "title": "string", "score": "float"}] }},
+            "get": {"data": {"path": "string", "title": "string", "tags": ["string"], "headings": ["string"], "links": ["string"], "frontmatter": "object", "mtime": "int", "content": "string"}},
+            "tags": {"data": {"results": [{"tag": "string", "count": "int"}]}},
+            "links": {"data": {"from": "string", "links": ["string"]}},
+            "stats": {"data": {"documents": "int"}},
+            "init/index": {"data": {"message": "string", "vault": "string", "index": "string", "documents": "int"}}
+        }
+    });
+    let out = if pretty { serde_json::to_string_pretty(&schema)? } else { serde_json::to_string(&schema)? };
+    println!("{out}");
+    Ok(())
+}
+
+fn print_tool_spec(pretty: bool) -> Result<()> {
+    let spec = json!({
+        "name": "obsidx",
+        "description": "Local Obsidian vault indexer with JSON output. Composable CLI for LLM tools.",
+        "commands": [
+            {"name": "init", "args": "--vault <path> --index <path>", "json": true},
+            {"name": "index", "args": "--vault <path> --index <path> [--incremental]", "json": true},
+            {"name": "search", "args": "--index <path> --query <q> --limit 20 --json", "json": true},
+            {"name": "get", "args": "--index <path> --path <note.md> --json [--content]", "json": true},
+            {"name": "tags", "args": "--index <path> --json", "json": true},
+            {"name": "links", "args": "--index <path> --from <note.md> --json", "json": true},
+            {"name": "stats", "args": "--index <path> --json", "json": true}
+        ],
+        "output_contract": "All --json commands return {version, timestamp, data} with stable schemas.",
+        "errors": "On failure, return data.error = {code, message} where possible."
+    });
+    let out = if pretty { serde_json::to_string_pretty(&spec)? } else { serde_json::to_string(&spec)? };
+    println!("{out}");
+    Ok(())
 }
