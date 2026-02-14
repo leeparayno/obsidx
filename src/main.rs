@@ -111,6 +111,8 @@ enum Commands {
         max_chars: usize,
         #[arg(long, default_value_t = 200)]
         overlap: usize,
+        #[arg(long, default_value_t = false)]
+        incremental: bool,
     },
     /// Vector search over embeddings
     EmbedSearch {
@@ -222,7 +224,13 @@ fn main() -> Result<()> {
         Commands::Links { from, index, json } => list_links(&index, &from, json),
         Commands::Backlinks { to, index, json } => list_backlinks(&index, &to, json),
         Commands::Watch { vault, index, debounce_ms } => watch_vault(&vault, &index, debounce_ms),
-        Commands::EmbedIndex { vault, index, max_chars, overlap } => embed_index(&vault, &index, max_chars, overlap),
+        Commands::EmbedIndex {
+            vault,
+            index,
+            max_chars,
+            overlap,
+            incremental,
+        } => embed_index(&vault, &index, max_chars, overlap, incremental),
         Commands::EmbedSearch { query, index, limit, json } => embed_search(&index, &query, limit, json),
         Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json),
         Commands::Stats { index, json } => stats(&index, json),
@@ -645,37 +653,89 @@ struct VectorResult {
     chunk: String,
 }
 
-fn embed_index(vault: &str, index_dir: &str, max_chars: usize, overlap: usize) -> Result<()> {
+fn embed_index(
+    vault: &str,
+    index_dir: &str,
+    max_chars: usize,
+    overlap: usize,
+    incremental: bool,
+) -> Result<()> {
     fs::create_dir_all(index_dir).ok();
     let db_path = Path::new(index_dir).join("embeddings.db");
     let conn = Connection::open(db_path)?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS chunks (            id INTEGER PRIMARY KEY,            path TEXT,            chunk TEXT,            mtime INTEGER,            embedding TEXT        );",
+        "CREATE TABLE IF NOT EXISTS chunks (\
+            id INTEGER PRIMARY KEY,\
+            path TEXT,\
+            chunk TEXT,\
+            chunk_hash TEXT,\
+            mtime INTEGER,\
+            embedding TEXT\
+        );\
+         CREATE TABLE IF NOT EXISTS notes (\
+            path TEXT PRIMARY KEY,\
+            mtime INTEGER\
+        );\
+         CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);\
+         CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(chunk_hash);\
+        ",
     )?;
 
-    // Full rebuild for now
-    conn.execute("DELETE FROM chunks", [])?;
+    if !incremental {
+        conn.execute("DELETE FROM chunks", [])?;
+        conn.execute("DELETE FROM notes", [])?;
+    }
 
     let docs = scan_vault(Path::new(vault))?;
     let mut inserted = 0;
+    let mut skipped = 0;
+    let mut updated = 0;
+
     for doc in docs {
+        // Check note mtime
+        let mut stmt = conn.prepare("SELECT mtime FROM notes WHERE path = ?1")?;
+        let existing_mtime: Option<i64> = stmt
+            .query_row(params![doc.path], |row| row.get(0))
+            .ok();
+
+        if incremental {
+            if let Some(old) = existing_mtime {
+                if old >= doc.mtime {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            // remove old chunks for this path
+            conn.execute("DELETE FROM chunks WHERE path = ?1", params![doc.path])?;
+            updated += 1;
+        }
+
         let chunks = chunk_text(&doc.content, max_chars, overlap);
         for ch in chunks {
+            let hash = hash_str(&ch);
             let emb = hash_embedding(&ch, 256);
             let emb_json = serde_json::to_string(&emb).unwrap_or_else(|_| "[]".to_string());
             conn.execute(
-                "INSERT INTO chunks (path, chunk, mtime, embedding) VALUES (?1, ?2, ?3, ?4)",
-                params![doc.path, ch, doc.mtime, emb_json],
+                "INSERT INTO chunks (path, chunk, chunk_hash, mtime, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![doc.path, ch, hash, doc.mtime, emb_json],
             )?;
             inserted += 1;
         }
+
+        conn.execute(
+            "INSERT INTO notes (path, mtime) VALUES (?1, ?2)\
+             ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime",
+            params![doc.path, doc.mtime],
+        )?;
     }
 
     let out = json_response(json!({
         "message": "embeddings indexed (hash placeholder)",
         "vault": vault,
         "index": index_dir,
-        "chunks": inserted
+        "chunks": inserted,
+        "skipped": skipped,
+        "updated": updated
     }));
     println!("{out}");
     Ok(())
@@ -838,6 +898,14 @@ fn hash_embedding(text: &str, dims: usize) -> Vec<f32> {
         for v in &mut vec { *v /= norm; }
     }
     vec
+}
+
+fn hash_str(text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    format!("{:x}", h.finish())
 }
 
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
