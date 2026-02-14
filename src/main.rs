@@ -284,7 +284,7 @@ fn schema() -> Schema {
     let mut schema_builder = Schema::builder();
     schema_builder.add_text_field("path", STRING | STORED);
     schema_builder.add_text_field("title", TEXT | STORED);
-    schema_builder.add_text_field("content", TEXT);
+    schema_builder.add_text_field("content", TEXT | STORED);
     schema_builder.add_text_field("tags", TEXT | STORED);
     schema_builder.add_text_field("links", TEXT | STORED);
     schema_builder.add_text_field("links_term", TEXT);
