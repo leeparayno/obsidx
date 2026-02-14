@@ -10,6 +10,8 @@
     "links": "obsidx links --index <path> --from <note.md> --json",
     "backlinks": "obsidx backlinks --index <path> --to <note.md> --json",
     "stats": "obsidx stats --index <path> --json",
-    "watch": "obsidx watch --vault <path> --index <path> --debounce-ms 500"
+    "watch": "obsidx watch --vault <path> --index <path> --debounce-ms 500",
+    "note-create": "obsidx note-create --vault <path> --path <rel.md> [--content <text>|--stdin] [--reindex]",
+    "note-append": "obsidx note-append --vault <path> --path <rel.md> [--content <text>|--stdin] [--reindex]"
   }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
@@ -142,6 +143,44 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Create a note (optionally from stdin)
+    NoteCreate {
+        #[arg(long)]
+        vault: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long, default_value_t = false)]
+        stdin: bool,
+        #[arg(long, default_value_t = false)]
+        reindex: bool,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
+        #[arg(long, default_value_t = 1500)]
+        max_chars: usize,
+        #[arg(long, default_value_t = 200)]
+        overlap: usize,
+    },
+    /// Append to a note (optionally from stdin)
+    NoteAppend {
+        #[arg(long)]
+        vault: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long, default_value_t = false)]
+        stdin: bool,
+        #[arg(long, default_value_t = false)]
+        reindex: bool,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
+        #[arg(long, default_value_t = 1500)]
+        max_chars: usize,
+        #[arg(long, default_value_t = 200)]
+        overlap: usize,
+    },
     /// Index stats
     Stats {
         #[arg(long, default_value = "./.obsidx")]
@@ -233,6 +272,8 @@ fn main() -> Result<()> {
         } => embed_index(&vault, &index, max_chars, overlap, incremental),
         Commands::EmbedSearch { query, index, limit, json } => embed_search(&index, &query, limit, json),
         Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json),
+        Commands::NoteCreate { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_create(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
+        Commands::NoteAppend { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_append(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
         Commands::Stats { index, json } => stats(&index, json),
         Commands::Schema { pretty } => print_schema(pretty),
         Commands::ToolSpec { pretty } => print_tool_spec(pretty),
@@ -919,6 +960,70 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na.sqrt()*nb.sqrt()) }
 }
 
+
+fn note_create(vault: &str, rel_path: &str, content: Option<String>, stdin: bool, reindex: bool, index_dir: &str, max_chars: usize, overlap: usize) -> Result<()> {
+    let full_path = Path::new(vault).join(rel_path);
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = if stdin {
+        read_stdin()? 
+    } else {
+        content.unwrap_or_default()
+    };
+    fs::write(&full_path, body)?;
+
+    if reindex {
+        build_index(vault, index_dir, true)?;
+        embed_index(vault, index_dir, max_chars, overlap, true)?;
+    }
+
+    let out = json_response(json!({
+        "message": "note created",
+        "path": full_path.to_string_lossy().to_string(),
+        "reindexed": reindex
+    }));
+    println!("{out}");
+    Ok(())
+}
+
+fn note_append(vault: &str, rel_path: &str, content: Option<String>, stdin: bool, reindex: bool, index_dir: &str, max_chars: usize, overlap: usize) -> Result<()> {
+    let full_path = Path::new(vault).join(rel_path);
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = if stdin { read_stdin()? } else { content.unwrap_or_default() };
+    let mut existing = String::new();
+    if full_path.exists() {
+        existing = fs::read_to_string(&full_path)?;
+    }
+    let mut merged = existing;
+    if !merged.is_empty() && !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged.push_str(&body);
+    fs::write(&full_path, merged)?;
+
+    if reindex {
+        build_index(vault, index_dir, true)?;
+        embed_index(vault, index_dir, max_chars, overlap, true)?;
+    }
+
+    let out = json_response(json!({
+        "message": "note appended",
+        "path": full_path.to_string_lossy().to_string(),
+        "reindexed": reindex
+    }));
+    println!("{out}");
+    Ok(())
+}
+
+fn read_stdin() -> Result<String> {
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
 fn stats(index_dir: &str, json_out: bool) -> Result<()> {
     let index = Index::open_in_dir(index_dir)
         .with_context(|| format!("Index not found: {index_dir}"))?;
@@ -1148,6 +1253,8 @@ fn print_schema(pretty: bool) -> Result<()> {
             "links": {"data": {"from": "string", "links": ["string"]}},
             "backlinks": {"data": {"to": "string", "backlinks": ["string"]}},
             "stats": {"data": {"documents": "int"}},
+            "note_create": {"data": {"message": "string", "path": "string", "reindexed": "bool"}},
+            "note_append": {"data": {"message": "string", "path": "string", "reindexed": "bool"}},
             "init/index": {"data": {"message": "string", "vault": "string", "index": "string", "documents": "int"}}
         }
     });
@@ -1169,6 +1276,8 @@ fn print_tool_spec(pretty: bool) -> Result<()> {
             {"name": "links", "args": "--index <path> --from <note.md> --json", "json": true},
             {"name": "backlinks", "args": "--index <path> --to <note.md> --json", "json": true},
             {"name": "watch", "args": "--vault <path> --index <path> --debounce-ms 500", "json": false},
+            {"name": "note-create", "args": "--vault <path> --path <rel.md> [--content <text>|--stdin] [--reindex]", "json": true},
+            {"name": "note-append", "args": "--vault <path> --path <rel.md> [--content <text>|--stdin] [--reindex]", "json": true},
             {"name": "stats", "args": "--index <path> --json", "json": true}
         ],
         "output_contract": "All --json commands return {version, timestamp, data} with stable schemas.",
