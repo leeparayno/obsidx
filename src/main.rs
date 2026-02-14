@@ -1,4 +1,19 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
+use pulldown_cmark::{Event, Parser as MdParser, Tag, TagEnd};
+use regex::Regex;
+use serde::Serialize;
+use serde_json::json;
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
+use tantivy::schema::{Field, Schema, STORED, STRING, TEXT, FAST, Value};
+use tantivy::{doc, Index, IndexReader, TantivyDocument, Term};
+use walkdir::WalkDir;
 
 #[derive(Parser)]
 #[command(name = "obsidx", version, about = "Obsidian vault indexer")]
@@ -13,7 +28,7 @@ enum Commands {
     Init {
         #[arg(long)]
         vault: String,
-        #[arg(long)]
+        #[arg(long, default_value = "./.obsidx")]
         index: String,
     },
     /// Build or update the index
@@ -29,6 +44,8 @@ enum Commands {
     Search {
         #[arg(long)]
         query: String,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long, default_value_t = false)]
@@ -38,11 +55,15 @@ enum Commands {
     Get {
         #[arg(long)]
         path: String,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     /// List tags
     Tags {
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -50,40 +71,529 @@ enum Commands {
     Links {
         #[arg(long)]
         from: String,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     /// Index stats
     Stats {
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
 }
 
-fn main() {
+#[derive(Debug, Serialize)]
+struct SearchResult {
+    path: String,
+    title: String,
+    score: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct TagCount {
+    tag: String,
+    count: usize,
+}
+
+#[derive(Debug)]
+struct NoteDoc {
+    path: String,
+    title: String,
+    content: String,
+    tags: Vec<String>,
+    links: Vec<String>,
+    headings: Vec<String>,
+    frontmatter_json: String,
+    mtime: i64,
+}
+
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { .. } => {
-            println!("init: not implemented yet");
-        }
-        Commands::Index { .. } => {
-            println!("index: not implemented yet");
-        }
-        Commands::Search { .. } => {
-            println!("search: not implemented yet");
-        }
-        Commands::Get { .. } => {
-            println!("get: not implemented yet");
-        }
-        Commands::Tags { .. } => {
-            println!("tags: not implemented yet");
-        }
-        Commands::Links { .. } => {
-            println!("links: not implemented yet");
-        }
-        Commands::Stats { .. } => {
-            println!("stats: not implemented yet");
+        Commands::Init { vault, index } => init_index(&vault, &index),
+        Commands::Index {
+            vault,
+            index,
+            incremental,
+        } => build_index(&vault, &index, incremental),
+        Commands::Search {
+            query,
+            index,
+            limit,
+            json,
+        } => search_index(&index, &query, limit, json),
+        Commands::Get { path, index, json } => get_note(&index, &path, json),
+        Commands::Tags { index, json } => list_tags(&index, json),
+        Commands::Links { from, index, json } => list_links(&index, &from, json),
+        Commands::Stats { index, json } => stats(&index, json),
+    }
+}
+
+fn schema() -> Schema {
+    let mut schema_builder = Schema::builder();
+    schema_builder.add_text_field("path", STRING | STORED);
+    schema_builder.add_text_field("title", TEXT | STORED);
+    schema_builder.add_text_field("content", TEXT);
+    schema_builder.add_text_field("tags", TEXT | STORED);
+    schema_builder.add_text_field("links", TEXT | STORED);
+    schema_builder.add_text_field("headings", TEXT | STORED);
+    schema_builder.add_text_field("frontmatter", TEXT | STORED);
+    schema_builder.add_i64_field("mtime", FAST | STORED);
+    schema_builder.build()
+}
+
+fn init_index(vault: &str, index_dir: &str) -> Result<()> {
+    let index_path = PathBuf::from(index_dir);
+    if !index_path.exists() {
+        fs::create_dir_all(&index_path)
+            .with_context(|| format!("Failed to create index dir: {index_dir}"))?;
+    }
+    let schema = schema();
+    let _index = Index::create_in_dir(&index_path, schema)
+        .with_context(|| "Failed to create Tantivy index")?;
+
+    let out = json_response(json!({
+        "message": "index initialized",
+        "vault": vault,
+        "index": index_dir
+    }));
+    println!("{out}");
+    Ok(())
+}
+
+fn build_index(vault: &str, index_dir: &str, _incremental: bool) -> Result<()> {
+    let index_path = PathBuf::from(index_dir);
+    if !index_path.exists() {
+        fs::create_dir_all(&index_path)
+            .with_context(|| format!("Failed to create index dir: {index_dir}"))?;
+    }
+
+    let schema = schema();
+    let index = if let Ok(idx) = Index::open_in_dir(&index_path) {
+        idx
+    } else {
+        Index::create_in_dir(&index_path, schema.clone())?
+    };
+
+    let mut writer = index.writer(50_000_000)?;
+
+    // Full reindex for now.
+    writer.delete_all_documents()?;
+
+    let docs = scan_vault(Path::new(vault))?;
+    let total_docs = docs.len();
+    let fields = schema_fields(&index);
+
+    for doc in docs {
+        writer.add_document(doc! {
+            fields.path => doc.path,
+            fields.title => doc.title,
+            fields.content => doc.content,
+            fields.tags => serde_json::to_string(&doc.tags).unwrap_or_else(|_| "[]".to_string()),
+            fields.links => serde_json::to_string(&doc.links).unwrap_or_else(|_| "[]".to_string()),
+            fields.headings => serde_json::to_string(&doc.headings).unwrap_or_else(|_| "[]".to_string()),
+            fields.frontmatter => doc.frontmatter_json,
+            fields.mtime => doc.mtime,
+        })?;
+    }
+
+    writer.commit()?;
+
+    let out = json_response(json!({
+        "message": "index built",
+        "vault": vault,
+        "index": index_dir,
+        "documents": total_docs
+    }));
+    println!("{out}");
+    Ok(())
+}
+
+fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool) -> Result<()> {
+    let index = Index::open_in_dir(index_dir)
+        .with_context(|| format!("Index not found: {index_dir}"))?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+
+    let schema = index.schema();
+    let path_field = schema.get_field("path").unwrap();
+    let title_field = schema.get_field("title").unwrap();
+    let content_field = schema.get_field("content").unwrap();
+    let tags_field = schema.get_field("tags").unwrap();
+
+    let query_parser = QueryParser::for_index(&index, vec![title_field, content_field, tags_field]);
+    let q = query_parser.parse_query(query)?;
+    let top_docs = searcher.search(&q, &TopDocs::with_limit(limit))?;
+
+    let mut results = Vec::new();
+    for (score, doc_address) in top_docs {
+        let retrieved: TantivyDocument = searcher.doc(doc_address)?;
+        let path = retrieved
+            .get_first(path_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = retrieved
+            .get_first(title_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        results.push(SearchResult { path, title, score });
+    }
+
+    if json_out {
+        let out = json_response(json!({
+            "query": query,
+            "results": results
+        }));
+        println!("{out}");
+    } else {
+        for r in results {
+            println!("{}\t{}\t{:.2}", r.path, r.title, r.score);
         }
     }
+
+    Ok(())
+}
+
+fn get_note(index_dir: &str, path: &str, json_out: bool) -> Result<()> {
+    let index = Index::open_in_dir(index_dir)
+        .with_context(|| format!("Index not found: {index_dir}"))?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let schema = index.schema();
+    let path_field = schema.get_field("path").unwrap();
+
+    let term = Term::from_field_text(path_field, path);
+    let doc_opt: Option<TantivyDocument> = searcher
+        .search(
+            &tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic),
+            &TopDocs::with_limit(1),
+        )?
+        .into_iter()
+        .next()
+        .map(|(_, addr)| searcher.doc(addr))
+        .transpose()?;
+
+    if let Some(doc) = doc_opt {
+        let title = doc
+            .get_first(schema.get_field("title").unwrap())
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if json_out {
+            let out = json_response(json!({
+                "path": path,
+                "title": title
+            }));
+            println!("{out}");
+        } else {
+            println!("{}\t{}", path, title);
+        }
+    } else if json_out {
+        let out = json_response(json!({
+            "error": {
+                "code": "not_found",
+                "message": format!("No note found for path: {path}")
+            }
+        }));
+        println!("{out}");
+    }
+
+    Ok(())
+}
+
+fn list_tags(index_dir: &str, json_out: bool) -> Result<()> {
+    let index = Index::open_in_dir(index_dir)
+        .with_context(|| format!("Index not found: {index_dir}"))?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let schema = index.schema();
+    let tags_field = schema.get_field("tags").unwrap();
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for segment_reader in searcher.segment_readers() {
+        let store_reader = segment_reader.get_store_reader(0)?;
+        for doc_id in 0..segment_reader.max_doc() {
+            let doc: TantivyDocument = store_reader.get(doc_id)?;
+            if let Some(val) = doc.get_first(tags_field).and_then(|v| v.as_str()) {
+                if let Ok(tags) = serde_json::from_str::<Vec<String>>(val) {
+                    for tag in tags {
+                        *counts.entry(tag).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut results: Vec<TagCount> = counts
+        .into_iter()
+        .map(|(tag, count)| TagCount { tag, count })
+        .collect();
+    results.sort_by(|a, b| b.count.cmp(&a.count));
+
+    if json_out {
+        let out = json_response(json!({ "results": results }));
+        println!("{out}");
+    } else {
+        for r in results {
+            println!("{}\t{}", r.tag, r.count);
+        }
+    }
+
+    Ok(())
+}
+
+fn list_links(index_dir: &str, from: &str, json_out: bool) -> Result<()> {
+    let index = Index::open_in_dir(index_dir)
+        .with_context(|| format!("Index not found: {index_dir}"))?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let schema = index.schema();
+    let path_field = schema.get_field("path").unwrap();
+    let links_field = schema.get_field("links").unwrap();
+
+    let term = Term::from_field_text(path_field, from);
+    let doc_opt: Option<TantivyDocument> = searcher
+        .search(
+            &tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic),
+            &TopDocs::with_limit(1),
+        )?
+        .into_iter()
+        .next()
+        .map(|(_, addr)| searcher.doc(addr))
+        .transpose()?;
+
+    let mut links: Vec<String> = vec![];
+    if let Some(doc) = doc_opt {
+        if let Some(val) = doc.get_first(links_field).and_then(|v| v.as_str()) {
+            links = serde_json::from_str::<Vec<String>>(val).unwrap_or_default();
+        }
+    }
+
+    if json_out {
+        let out = json_response(json!({ "from": from, "links": links }));
+        println!("{out}");
+    } else {
+        for l in links {
+            println!("{l}");
+        }
+    }
+
+    Ok(())
+}
+
+fn stats(index_dir: &str, json_out: bool) -> Result<()> {
+    let index = Index::open_in_dir(index_dir)
+        .with_context(|| format!("Index not found: {index_dir}"))?;
+    let reader: IndexReader = index.reader()?;
+    let searcher = reader.searcher();
+
+    let num_docs = searcher.num_docs();
+    let out = json_response(json!({ "documents": num_docs }));
+
+    if json_out {
+        println!("{out}");
+    } else {
+        println!("{num_docs}");
+    }
+    Ok(())
+}
+
+struct SchemaFields {
+    path: Field,
+    title: Field,
+    content: Field,
+    tags: Field,
+    links: Field,
+    headings: Field,
+    frontmatter: Field,
+    mtime: Field,
+}
+
+fn schema_fields(index: &Index) -> SchemaFields {
+    let schema = index.schema();
+    SchemaFields {
+        path: schema.get_field("path").unwrap(),
+        title: schema.get_field("title").unwrap(),
+        content: schema.get_field("content").unwrap(),
+        tags: schema.get_field("tags").unwrap(),
+        links: schema.get_field("links").unwrap(),
+        headings: schema.get_field("headings").unwrap(),
+        frontmatter: schema.get_field("frontmatter").unwrap(),
+        mtime: schema.get_field("mtime").unwrap(),
+    }
+}
+
+fn scan_vault(vault: &Path) -> Result<Vec<NoteDoc>> {
+    let mut docs = Vec::new();
+    for entry in WalkDir::new(vault).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed reading: {}", path.display()))?;
+            let meta = fs::metadata(path)?;
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let parsed = parse_note(path, &content);
+            docs.push(NoteDoc {
+                path: path.to_string_lossy().to_string(),
+                title: parsed.title,
+                content: parsed.content,
+                tags: parsed.tags,
+                links: parsed.links,
+                headings: parsed.headings,
+                frontmatter_json: parsed.frontmatter_json,
+                mtime,
+            });
+        }
+    }
+    Ok(docs)
+}
+
+struct ParsedNote {
+    title: String,
+    content: String,
+    tags: Vec<String>,
+    links: Vec<String>,
+    headings: Vec<String>,
+    frontmatter_json: String,
+}
+
+fn parse_note(path: &Path, raw: &str) -> ParsedNote {
+    let (frontmatter_raw, body) = extract_frontmatter(raw);
+    let mut tags = extract_inline_tags(&body);
+
+    let frontmatter_json = if let Some(raw_fm) = frontmatter_raw.as_deref() {
+        if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(raw_fm) {
+            if let Some(fm_tags) = extract_yaml_tags(&yaml) {
+                tags.extend(fm_tags);
+            }
+            serde_json::to_string(&yaml).unwrap_or_else(|_| "{}".to_string())
+        } else {
+            "{}".to_string()
+        }
+    } else {
+        "{}".to_string()
+    };
+
+    tags.sort();
+    tags.dedup();
+
+    let (headings, links) = extract_headings_and_links(&body);
+
+    let title = headings
+        .first()
+        .map(|h| h.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Untitled")
+                .to_string()
+        });
+
+    ParsedNote {
+        title,
+        content: body,
+        tags,
+        links,
+        headings,
+        frontmatter_json,
+    }
+}
+
+fn extract_frontmatter(raw: &str) -> (Option<String>, String) {
+    if raw.starts_with("---\n") {
+        if let Some(end) = raw[4..].find("\n---") {
+            let fm = &raw[4..4 + end];
+            let rest = &raw[4 + end + 4..];
+            return (Some(fm.to_string()), rest.trim_start().to_string());
+        }
+    }
+    (None, raw.to_string())
+}
+
+fn extract_yaml_tags(yaml: &serde_yaml::Value) -> Option<Vec<String>> {
+    match yaml.get("tags") {
+        Some(serde_yaml::Value::Sequence(seq)) => {
+            let tags = seq
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>();
+            Some(tags)
+        }
+        Some(serde_yaml::Value::String(s)) => Some(vec![s.to_string()]),
+        _ => None,
+    }
+}
+
+fn extract_inline_tags(body: &str) -> Vec<String> {
+    let re = Regex::new(r"(?m)(?:^|\s)#([A-Za-z0-9_\-/]+)").unwrap();
+    re.captures_iter(body)
+        .filter_map(|cap| cap.get(1))
+        .map(|m| m.as_str().to_string())
+        .collect()
+}
+
+fn extract_headings_and_links(body: &str) -> (Vec<String>, Vec<String>) {
+    let parser = MdParser::new(body);
+    let mut headings = Vec::new();
+    let mut links = Vec::new();
+
+    let mut in_heading = false;
+    let mut heading_text = String::new();
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::Heading { .. }) => {
+                in_heading = true;
+                heading_text.clear();
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if !heading_text.is_empty() {
+                    headings.push(heading_text.trim().to_string());
+                }
+                in_heading = false;
+            }
+            Event::Text(t) => {
+                if in_heading {
+                    heading_text.push_str(&t);
+                }
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                links.push(dest_url.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    // Wikilinks [[note]]
+    let re = Regex::new(r"\[\[([^\]]+)\]\]").unwrap();
+    for cap in re.captures_iter(body) {
+        if let Some(m) = cap.get(1) {
+            links.push(m.as_str().to_string());
+        }
+    }
+
+    links.sort();
+    links.dedup();
+
+    (headings, links)
+}
+
+fn json_response(payload: serde_json::Value) -> String {
+    let wrapper = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "timestamp": Utc::now().to_rfc3339(),
+        "data": payload
+    });
+    serde_json::to_string_pretty(&wrapper).unwrap_or_else(|_| "{}".to_string())
 }
