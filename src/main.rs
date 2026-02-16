@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read;
+use std::io::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
@@ -238,6 +239,8 @@ enum Commands {
         #[arg(long)]
         collection: Option<String>,
     },
+    /// MCP stdio server
+    Mcp {},
     /// Index stats
     Stats {
         #[arg(long, default_value = "./.obsidx")]
@@ -345,6 +348,7 @@ fn main() -> Result<()> {
         Commands::CollectionAdd { name, path } => collection_add(&name, &path),
         Commands::CollectionList {} => collection_list(),
         Commands::CollectionRemove { name } => collection_remove(&name),
+        Commands::Mcp {} => mcp_server(),
         Commands::Stats { index, json } => stats(&index, json),
         Commands::Schema { pretty } => print_schema(pretty),
         Commands::ToolSpec { pretty } => print_tool_spec(pretty),
@@ -1346,6 +1350,91 @@ fn multi_get(index_dir: &str, paths: Option<String>, glob_pat: Option<String>, j
             println!("{}", r);
         }
     }
+    Ok(())
+}
+
+
+fn mcp_server() -> Result<()> {
+    use std::io::{self, BufRead};
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let reader = stdin.lock();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() { continue; }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                let err = json_response(json!({"error": {"code": "bad_json", "message": e.to_string()}}));
+                writeln!(stdout, "{}", err)?;
+                continue;
+            }
+        };
+        let tool = v.get("tool").and_then(|t| t.as_str()).unwrap_or("");
+        let args = v.get("args").cloned().unwrap_or(json!({}));
+
+        let result = match tool {
+            "search" => {
+                let index = args.get("index").and_then(|v| v.as_str()).unwrap_or("./.obsidx");
+                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let collection = args.get("collection").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let min_score = args.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let files = args.get("files").and_then(|v| v.as_bool()).unwrap_or(false);
+                let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+                search_index(index, query, limit, true, collection, min_score, files, all)
+            }
+            "vector" => {
+                let index = args.get("index").and_then(|v| v.as_str()).unwrap_or("./.obsidx");
+                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                let collection = args.get("collection").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let min_score = args.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let files = args.get("files").and_then(|v| v.as_bool()).unwrap_or(false);
+                let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+                embed_search(index, query, limit, true, collection, min_score, files, all)
+            }
+            "hybrid" => {
+                let index = args.get("index").and_then(|v| v.as_str()).unwrap_or("./.obsidx");
+                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let rrf_k = args.get("rrf_k").and_then(|v| v.as_u64()).unwrap_or(60) as u32;
+                let bm25_limit = args.get("bm25_limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+                let vec_limit = args.get("vec_limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+                let collection = args.get("collection").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let min_score = args.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let files = args.get("files").and_then(|v| v.as_bool()).unwrap_or(false);
+                let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+                hybrid_search(index, query, limit, rrf_k, bm25_limit, vec_limit, true, collection, min_score, files, all)
+            }
+            "get" => {
+                let index = args.get("index").and_then(|v| v.as_str()).unwrap_or("./.obsidx");
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let content = args.get("content").and_then(|v| v.as_bool()).unwrap_or(false);
+                let collection = args.get("collection").and_then(|v| v.as_str()).map(|s| s.to_string());
+                get_note(index, path, true, content, collection)
+            }
+            "multi_get" => {
+                let index = args.get("index").and_then(|v| v.as_str()).unwrap_or("./.obsidx");
+                let paths = args.get("paths").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let glob_pat = args.get("glob").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let collection = args.get("collection").and_then(|v| v.as_str()).map(|s| s.to_string());
+                multi_get(index, paths, glob_pat, true, collection)
+            }
+            "status" => {
+                let index = args.get("index").and_then(|v| v.as_str()).unwrap_or("./.obsidx");
+                stats(index, true)
+            }
+            _ => Err(anyhow::anyhow!("Unknown tool: {}", tool)),
+        };
+
+        if let Err(e) = result {
+            let err = json_response(json!({"error": {"code": "exception", "message": e.to_string()}}));
+            writeln!(stdout, "{}", err)?;
+        }
+    }
+
     Ok(())
 }
 
