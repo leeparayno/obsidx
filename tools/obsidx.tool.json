@@ -18,6 +18,7 @@
     "hybrid": "obsidx hybrid --index <path> --query <q> --json [--collection <name>]",
     "collection-add": "obsidx collection-add --name <name> --path <path>",
     "collection-list": "obsidx collection-list",
-    "collection-remove": "obsidx collection-remove --name <name>"
+    "collection-remove": "obsidx collection-remove --name <name>",
+    "multi-get": "obsidx multi-get --paths a,b,c --glob \"Notes/*.md\" --json [--collection <name>]"
   }
 }

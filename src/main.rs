@@ -13,6 +13,7 @@ use regex::Regex;
 use notify::{RecursiveMode, Watcher, Config as NotifyConfig};
 use rusqlite::{Connection, params};
 use toml;
+use glob::glob;
 use serde::Serialize;
 use serde_json::json;
 use tantivy::collector::TopDocs;
@@ -206,6 +207,19 @@ enum Commands {
         #[arg(long)]
         name: String,
     },
+    /// Multi-get documents by glob or list
+    MultiGet {
+        #[arg(long)]
+        paths: Option<String>,
+        #[arg(long)]
+        glob: Option<String>,
+        #[arg(long, default_value = "./.obsidx")]
+        index: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long)]
+        collection: Option<String>,
+    },
     /// Index stats
     Stats {
         #[arg(long, default_value = "./.obsidx")]
@@ -230,6 +244,7 @@ struct SearchResult {
     path: String,
     title: String,
     score: f32,
+    doc_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -254,6 +269,7 @@ struct NoteDetail {
 struct NoteDoc {
     path: String,
     collection: String,
+    doc_id: String,
     title: String,
     content: String,
     tags: Vec<String>,
@@ -304,6 +320,7 @@ fn main() -> Result<()> {
         Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json, collection } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json, collection),
         Commands::NoteCreate { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_create(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
         Commands::NoteAppend { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_append(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
+        Commands::MultiGet { paths, glob, index, json, collection } => multi_get(&index, paths, glob, json, collection),
         Commands::CollectionAdd { name, path } => collection_add(&name, &path),
         Commands::CollectionList {} => collection_list(),
         Commands::CollectionRemove { name } => collection_remove(&name),
@@ -379,10 +396,24 @@ fn resolve_collection_path(collection: &Option<String>) -> Result<Option<PathBuf
     Ok(None)
 }
 
+
+struct DocLookup {
+    is_doc_id: bool,
+    value: String,
+}
+
+fn resolve_doc_id(input: &str) -> DocLookup {
+    if let Some(stripped) = input.strip_prefix('#') {
+        return DocLookup { is_doc_id: true, value: stripped.to_string() };
+    }
+    DocLookup { is_doc_id: false, value: input.to_string() }
+}
+
 fn schema() -> Schema {
     let mut schema_builder = Schema::builder();
     schema_builder.add_text_field("path", STRING | STORED);
     schema_builder.add_text_field("collection", STRING | STORED);
+    schema_builder.add_text_field("doc_id", STRING | STORED);
     schema_builder.add_text_field("title", TEXT | STORED);
     schema_builder.add_text_field("content", TEXT | STORED);
     schema_builder.add_text_field("tags", TEXT | STORED);
@@ -481,6 +512,7 @@ fn build_index(vault: &str, index_dir: &str, incremental: bool, collection: Opti
         let mut tdoc = doc! {
             fields.path => doc.path,
             fields.collection => doc.collection,
+            fields.doc_id => doc.doc_id,
             fields.title => doc.title,
             fields.content => doc.content,
             fields.tags => serde_json::to_string(&doc.tags).unwrap_or_else(|_| "[]".to_string()),
@@ -517,6 +549,7 @@ fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool, coll
     let path_field = schema.get_field("path").unwrap();
     let title_field = schema.get_field("title").unwrap();
     let content_field = schema.get_field("content").unwrap();
+    let docid_field = schema.get_field("doc_id").unwrap();
     let tags_field = schema.get_field("tags").unwrap();
     let collection_field = schema.get_field("collection").unwrap();
 
@@ -544,7 +577,12 @@ fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool, coll
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        results.push(SearchResult { path, title, score });
+        let doc_id = retrieved
+            .get_first(docid_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        results.push(SearchResult { path, title, score, doc_id });
     }
 
     if json_out {
@@ -563,6 +601,7 @@ fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool, coll
 }
 
 fn get_note(index_dir: &str, path: &str, json_out: bool, include_content: bool, collection: Option<String>) -> Result<()> {
+    let lookup = resolve_doc_id(path);
     let index = Index::open_in_dir(index_dir)
         .with_context(|| format!("Index not found: {index_dir}"))?;
     let reader = index.reader()?;
@@ -570,7 +609,11 @@ fn get_note(index_dir: &str, path: &str, json_out: bool, include_content: bool, 
     let schema = index.schema();
     let path_field = schema.get_field("path").unwrap();
 
-    let term = Term::from_field_text(path_field, path);
+    let term = if lookup.is_doc_id {
+        Term::from_field_text(schema.get_field("doc_id").unwrap(), &lookup.value)
+    } else {
+        Term::from_field_text(path_field, &lookup.value)
+    };
     let doc_opt: Option<TantivyDocument> = searcher
         .search(
             &tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic),
@@ -1001,6 +1044,7 @@ fn bm25_search(index_dir: &str, query: &str, limit: usize, collection: Option<St
     let path_field = schema.get_field("path").unwrap();
     let title_field = schema.get_field("title").unwrap();
     let content_field = schema.get_field("content").unwrap();
+    let docid_field = schema.get_field("doc_id").unwrap();
     let tags_field = schema.get_field("tags").unwrap();
     let collection_field = schema.get_field("collection").unwrap();
 
@@ -1028,7 +1072,12 @@ fn bm25_search(index_dir: &str, query: &str, limit: usize, collection: Option<St
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        results.push(SearchResult { path, title, score });
+        let doc_id = retrieved
+            .get_first(docid_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        results.push(SearchResult { path, title, score, doc_id });
     }
     Ok(results)
 }
@@ -1188,6 +1237,71 @@ fn read_stdin() -> Result<String> {
     Ok(buf)
 }
 
+
+fn multi_get(index_dir: &str, paths: Option<String>, glob_pat: Option<String>, json_out: bool, collection: Option<String>) -> Result<()> {
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(p) = paths {
+        for part in p.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() { targets.push(trimmed.to_string()); }
+        }
+    }
+    if let Some(g) = glob_pat {
+        for entry in glob(&g)? {
+            if let Ok(path) = entry {
+                targets.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    if targets.is_empty() {
+        anyhow::bail!("No paths provided");
+    }
+
+    let mut results = Vec::new();
+    for t in targets {
+        // reuse get_note by calling searcher directly
+        let index = Index::open_in_dir(index_dir)?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let schema = index.schema();
+        let lookup = resolve_doc_id(&t);
+        let term = if lookup.is_doc_id {
+            Term::from_field_text(schema.get_field("doc_id").unwrap(), &lookup.value)
+        } else {
+            Term::from_field_text(schema.get_field("path").unwrap(), &lookup.value)
+        };
+        let doc_opt: Option<TantivyDocument> = searcher
+            .search(&tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic), &TopDocs::with_limit(1))?
+            .into_iter()
+            .next()
+            .map(|(_, addr)| searcher.doc(addr))
+            .transpose()?;
+        if let Some(doc) = doc_opt {
+            if let Some(name) = collection.as_ref() {
+                let coll = doc
+                    .get_first(schema.get_field("collection").unwrap())
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if coll != name { continue; }
+            }
+            let path = doc.get_first(schema.get_field("path").unwrap()).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title = doc.get_first(schema.get_field("title").unwrap()).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let doc_id = doc.get_first(schema.get_field("doc_id").unwrap()).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            results.push(json!({"path": path, "title": title, "doc_id": doc_id}));
+        }
+    }
+
+    if json_out {
+        let out = json_response(json!({"results": results}));
+        println!("{out}");
+    } else {
+        for r in results {
+            println!("{}", r);
+        }
+    }
+    Ok(())
+}
+
 fn stats(index_dir: &str, json_out: bool) -> Result<()> {
     let index = Index::open_in_dir(index_dir)
         .with_context(|| format!("Index not found: {index_dir}"))?;
@@ -1208,6 +1322,7 @@ fn stats(index_dir: &str, json_out: bool) -> Result<()> {
 struct SchemaFields {
     path: Field,
     collection: Field,
+    doc_id: Field,
     title: Field,
     content: Field,
     tags: Field,
@@ -1223,6 +1338,7 @@ fn schema_fields(index: &Index) -> SchemaFields {
     SchemaFields {
         path: schema.get_field("path").unwrap(),
         collection: schema.get_field("collection").unwrap(),
+        doc_id: schema.get_field("doc_id").unwrap(),
         title: schema.get_field("title").unwrap(),
         content: schema.get_field("content").unwrap(),
         tags: schema.get_field("tags").unwrap(),
@@ -1249,9 +1365,12 @@ fn scan_vault(vault: &Path, collection_name: &str) -> Result<Vec<NoteDoc>> {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let parsed = parse_note(path, &content);
+            let full_path = path.to_string_lossy().to_string();
+            let doc_id = hash_str(&full_path);
             docs.push(NoteDoc {
-                path: path.to_string_lossy().to_string(),
+                path: full_path,
                 collection: collection_name.to_string(),
+                doc_id,
                 title: parsed.title,
                 content: parsed.content,
                 tags: parsed.tags,
