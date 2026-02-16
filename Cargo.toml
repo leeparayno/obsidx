@@ -17,4 +17,5 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 notify = "6"
 rusqlite = { version = "0.31", features = ["bundled"] }
+toml = "0.8"
 

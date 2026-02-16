@@ -10,8 +10,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use pulldown_cmark::{Event, Parser as MdParser, Tag, TagEnd};
 use regex::Regex;
-use notify::{RecursiveMode, Watcher, Config};
+use notify::{RecursiveMode, Watcher, Config as NotifyConfig};
 use rusqlite::{Connection, params};
+use toml;
 use serde::Serialize;
 use serde_json::json;
 use tantivy::collector::TopDocs;
@@ -44,6 +45,8 @@ enum Commands {
         index: String,
         #[arg(long, default_value_t = false)]
         incremental: bool,
+        #[arg(long)]
+        collection: Option<String>,
     },
     /// Search the index
     Search {
@@ -55,6 +58,8 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long)]
+        collection: Option<String>,
     },
     /// Get a note by path
     Get {
@@ -67,6 +72,8 @@ enum Commands {
         /// Include content in response
         #[arg(long, default_value_t = false)]
         content: bool,
+        #[arg(long)]
+        collection: Option<String>,
     },
     /// List tags
     Tags {
@@ -114,6 +121,8 @@ enum Commands {
         overlap: usize,
         #[arg(long, default_value_t = false)]
         incremental: bool,
+        #[arg(long)]
+        collection: Option<String>,
     },
     /// Vector search over embeddings
     EmbedSearch {
@@ -125,6 +134,8 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long)]
+        collection: Option<String>,
     },
     /// Hybrid search (BM25 + Vector) with RRF
     Hybrid {
@@ -142,6 +153,8 @@ enum Commands {
         vec_limit: usize,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long)]
+        collection: Option<String>,
     },
     /// Create a note (optionally from stdin)
     NoteCreate {
@@ -180,6 +193,18 @@ enum Commands {
         max_chars: usize,
         #[arg(long, default_value_t = 200)]
         overlap: usize,
+    },
+    /// Manage collections
+    CollectionAdd {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        path: String,
+    },
+    CollectionList {},
+    CollectionRemove {
+        #[arg(long)]
+        name: String,
     },
     /// Index stats
     Stats {
@@ -228,6 +253,7 @@ struct NoteDetail {
 #[derive(Debug)]
 struct NoteDoc {
     path: String,
+    collection: String,
     title: String,
     content: String,
     tags: Vec<String>,
@@ -246,19 +272,22 @@ fn main() -> Result<()> {
             vault,
             index,
             incremental,
-        } => build_index(&vault, &index, incremental),
+            collection,
+        } => build_index(&vault, &index, incremental, collection),
         Commands::Search {
             query,
             index,
             limit,
             json,
-        } => search_index(&index, &query, limit, json),
+            collection,
+        } => search_index(&index, &query, limit, json, collection),
         Commands::Get {
             path,
             index,
             json,
             content,
-        } => get_note(&index, &path, json, content),
+            collection,
+        } => get_note(&index, &path, json, content, collection),
         Commands::Tags { index, json } => list_tags(&index, json),
         Commands::Links { from, index, json } => list_links(&index, &from, json),
         Commands::Backlinks { to, index, json } => list_backlinks(&index, &to, json),
@@ -269,20 +298,91 @@ fn main() -> Result<()> {
             max_chars,
             overlap,
             incremental,
-        } => embed_index(&vault, &index, max_chars, overlap, incremental),
-        Commands::EmbedSearch { query, index, limit, json } => embed_search(&index, &query, limit, json),
-        Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json),
+            collection,
+        } => embed_index(&vault, &index, max_chars, overlap, incremental, collection),
+        Commands::EmbedSearch { query, index, limit, json, collection } => embed_search(&index, &query, limit, json, collection),
+        Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json, collection } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json, collection),
         Commands::NoteCreate { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_create(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
         Commands::NoteAppend { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_append(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
+        Commands::CollectionAdd { name, path } => collection_add(&name, &path),
+        Commands::CollectionList {} => collection_list(),
+        Commands::CollectionRemove { name } => collection_remove(&name),
         Commands::Stats { index, json } => stats(&index, json),
         Commands::Schema { pretty } => print_schema(pretty),
         Commands::ToolSpec { pretty } => print_tool_spec(pretty),
     }
 }
 
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct ObsidxConfig {
+    collections: std::collections::HashMap<String, String>,
+}
+
+fn config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".obsidx").join("config.toml")
+}
+
+fn load_config() -> ObsidxConfig {
+    let path = config_path();
+    if let Ok(s) = fs::read_to_string(path) {
+        toml::from_str(&s).unwrap_or_default()
+    } else {
+        ObsidxConfig::default()
+    }
+}
+
+fn save_config(cfg: &ObsidxConfig) -> Result<()> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let s = toml::to_string_pretty(cfg).unwrap_or_default();
+    fs::write(path, s)?;
+    Ok(())
+}
+
+fn collection_add(name: &str, path: &str) -> Result<()> {
+    let mut cfg = load_config();
+    cfg.collections.insert(name.to_string(), path.to_string());
+    save_config(&cfg)?;
+    let out = json_response(json!({"message": "collection added", "name": name, "path": path}));
+    println!("{out}");
+    Ok(())
+}
+
+fn collection_list() -> Result<()> {
+    let cfg = load_config();
+    let out = json_response(json!({"collections": cfg.collections}));
+    println!("{out}");
+    Ok(())
+}
+
+fn collection_remove(name: &str) -> Result<()> {
+    let mut cfg = load_config();
+    cfg.collections.remove(name);
+    save_config(&cfg)?;
+    let out = json_response(json!({"message": "collection removed", "name": name}));
+    println!("{out}");
+    Ok(())
+}
+
+fn resolve_collection_path(collection: &Option<String>) -> Result<Option<PathBuf>> {
+    if let Some(name) = collection {
+        let cfg = load_config();
+        if let Some(p) = cfg.collections.get(name) {
+            return Ok(Some(PathBuf::from(p)));
+        }
+        anyhow::bail!("Unknown collection: {name}")
+    }
+    Ok(None)
+}
+
 fn schema() -> Schema {
     let mut schema_builder = Schema::builder();
     schema_builder.add_text_field("path", STRING | STORED);
+    schema_builder.add_text_field("collection", STRING | STORED);
     schema_builder.add_text_field("title", TEXT | STORED);
     schema_builder.add_text_field("content", TEXT | STORED);
     schema_builder.add_text_field("tags", TEXT | STORED);
@@ -313,7 +413,7 @@ fn init_index(vault: &str, index_dir: &str) -> Result<()> {
     Ok(())
 }
 
-fn build_index(vault: &str, index_dir: &str, incremental: bool) -> Result<()> {
+fn build_index(vault: &str, index_dir: &str, incremental: bool, collection: Option<String>) -> Result<()> {
     let index_path = PathBuf::from(index_dir);
     if !index_path.exists() {
         fs::create_dir_all(&index_path)
@@ -333,7 +433,9 @@ fn build_index(vault: &str, index_dir: &str, incremental: bool) -> Result<()> {
         writer.delete_all_documents()?;
     }
 
-    let docs = scan_vault(Path::new(vault))?;
+    let collection_path = resolve_collection_path(&collection)?;
+    let (scan_root, collection_name) = if let Some(p) = collection_path { (p, collection.unwrap()) } else { (PathBuf::from(vault), "default".to_string()) };
+    let docs = scan_vault(&scan_root, &collection_name)?;
     let total_docs = docs.len();
     let fields = schema_fields(&index);
 
@@ -378,6 +480,7 @@ fn build_index(vault: &str, index_dir: &str, incremental: bool) -> Result<()> {
 
         let mut tdoc = doc! {
             fields.path => doc.path,
+            fields.collection => doc.collection,
             fields.title => doc.title,
             fields.content => doc.content,
             fields.tags => serde_json::to_string(&doc.tags).unwrap_or_else(|_| "[]".to_string()),
@@ -404,7 +507,7 @@ fn build_index(vault: &str, index_dir: &str, incremental: bool) -> Result<()> {
     Ok(())
 }
 
-fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool) -> Result<()> {
+fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool, collection: Option<String>) -> Result<()> {
     let index = Index::open_in_dir(index_dir)
         .with_context(|| format!("Index not found: {index_dir}"))?;
     let reader = index.reader()?;
@@ -415,10 +518,18 @@ fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool) -> R
     let title_field = schema.get_field("title").unwrap();
     let content_field = schema.get_field("content").unwrap();
     let tags_field = schema.get_field("tags").unwrap();
+    let collection_field = schema.get_field("collection").unwrap();
 
     let query_parser = QueryParser::for_index(&index, vec![title_field, content_field, tags_field]);
     let q = query_parser.parse_query(query)?;
-    let top_docs = searcher.search(&q, &TopDocs::with_limit(limit))?;
+    let top_docs = if let Some(name) = collection {
+        let term = Term::from_field_text(collection_field, &name);
+        let filter = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+        let combined = tantivy::query::BooleanQuery::intersection(vec![Box::new(q), Box::new(filter)]);
+        searcher.search(&combined, &TopDocs::with_limit(limit))?
+    } else {
+        searcher.search(&q, &TopDocs::with_limit(limit))?
+    };
 
     let mut results = Vec::new();
     for (score, doc_address) in top_docs {
@@ -451,7 +562,7 @@ fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool) -> R
     Ok(())
 }
 
-fn get_note(index_dir: &str, path: &str, json_out: bool, include_content: bool) -> Result<()> {
+fn get_note(index_dir: &str, path: &str, json_out: bool, include_content: bool, collection: Option<String>) -> Result<()> {
     let index = Index::open_in_dir(index_dir)
         .with_context(|| format!("Index not found: {index_dir}"))?;
     let reader = index.reader()?;
@@ -471,6 +582,19 @@ fn get_note(index_dir: &str, path: &str, json_out: bool, include_content: bool) 
         .transpose()?;
 
     if let Some(doc) = doc_opt {
+        if let Some(name) = collection.as_ref() {
+            let coll = doc
+                .get_first(schema.get_field("collection").unwrap())
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if coll != name {
+                if json_out {
+                    let out = json_response(json!({"error": {"code": "not_found", "message": "Not in collection"}}));
+                    println!("{out}");
+                }
+                return Ok(());
+            }
+        }
         let title = doc
             .get_first(schema.get_field("title").unwrap())
             .and_then(|v| v.as_str())
@@ -662,11 +786,11 @@ fn list_backlinks(index_dir: &str, to: &str, json_out: bool) -> Result<()> {
 
 fn watch_vault(vault: &str, index_dir: &str, debounce_ms: u64) -> Result<()> {
     // Initial index
-    build_index(vault, index_dir, true)?;
+    build_index(vault, index_dir, true, None)?;
 
     let (tx, rx) = channel();
     let mut watcher = notify::recommended_watcher(tx)?;
-    watcher.configure(Config::default().with_poll_interval(Duration::from_millis(250)))?;
+    watcher.configure(NotifyConfig::default().with_poll_interval(Duration::from_millis(250)))?;
     watcher.watch(Path::new(vault), RecursiveMode::Recursive)?;
 
     println!("Watching {} (index: {})", vault, index_dir);
@@ -682,7 +806,7 @@ fn watch_vault(vault: &str, index_dir: &str, debounce_ms: u64) -> Result<()> {
             }
         }
         // incremental rebuild
-        let _ = build_index(vault, index_dir, true);
+        let _ = build_index(vault, index_dir, true, None);
     }
 }
 
@@ -700,6 +824,7 @@ fn embed_index(
     max_chars: usize,
     overlap: usize,
     incremental: bool,
+    collection: Option<String>,
 ) -> Result<()> {
     fs::create_dir_all(index_dir).ok();
     let db_path = Path::new(index_dir).join("embeddings.db");
@@ -708,6 +833,7 @@ fn embed_index(
         "CREATE TABLE IF NOT EXISTS chunks (\
             id INTEGER PRIMARY KEY,\
             path TEXT,\
+            collection TEXT,\
             chunk TEXT,\
             chunk_hash TEXT,\
             mtime INTEGER,\
@@ -715,10 +841,12 @@ fn embed_index(
         );\
          CREATE TABLE IF NOT EXISTS notes (\
             path TEXT PRIMARY KEY,\
+            collection TEXT,\
             mtime INTEGER\
         );\
          CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);\
          CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(chunk_hash);\
+         CREATE INDEX IF NOT EXISTS idx_chunks_collection ON chunks(collection);\
         ",
     )?;
 
@@ -727,7 +855,9 @@ fn embed_index(
         conn.execute("DELETE FROM notes", [])?;
     }
 
-    let docs = scan_vault(Path::new(vault))?;
+    let collection_path = resolve_collection_path(&collection)?;
+    let (scan_root, collection_name) = if let Some(p) = collection_path { (p, collection.unwrap()) } else { (PathBuf::from(vault), "default".to_string()) };
+    let docs = scan_vault(&scan_root, &collection_name)?;
     let mut inserted = 0;
     let mut skipped = 0;
     let mut updated = 0;
@@ -757,16 +887,16 @@ fn embed_index(
             let emb = hash_embedding(&ch, 256);
             let emb_json = serde_json::to_string(&emb).unwrap_or_else(|_| "[]".to_string());
             conn.execute(
-                "INSERT INTO chunks (path, chunk, chunk_hash, mtime, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![doc.path, ch, hash, doc.mtime, emb_json],
+                "INSERT INTO chunks (path, collection, chunk, chunk_hash, mtime, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![doc.path, doc.collection, ch, hash, doc.mtime, emb_json],
             )?;
             inserted += 1;
         }
 
         conn.execute(
-            "INSERT INTO notes (path, mtime) VALUES (?1, ?2)\
-             ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime",
-            params![doc.path, doc.mtime],
+            "INSERT INTO notes (path, collection, mtime) VALUES (?1, ?2, ?3)\
+             ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, collection=excluded.collection",
+            params![doc.path, doc.collection, doc.mtime],
         )?;
     }
 
@@ -782,23 +912,36 @@ fn embed_index(
     Ok(())
 }
 
-fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool) -> Result<()> {
+fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool, collection: Option<String>) -> Result<()> {
     let db_path = Path::new(index_dir).join("embeddings.db");
     let conn = Connection::open(db_path)?;
     let qemb = hash_embedding(query, 256);
 
-    let mut stmt = conn.prepare("SELECT path, chunk, embedding FROM chunks")?;
-    let rows = stmt.query_map([], |row| {
-        let path: String = row.get(0)?;
-        let chunk: String = row.get(1)?;
-        let emb_json: String = row.get(2)?;
-        let emb: Vec<f32> = serde_json::from_str(&emb_json).unwrap_or_default();
-        Ok((path, chunk, emb))
-    })?;
+    let mut stmt = if collection.is_some() {
+        conn.prepare("SELECT path, chunk, embedding FROM chunks WHERE collection = ?1")?
+    } else {
+        conn.prepare("SELECT path, chunk, embedding FROM chunks")?
+    };
+    let rows_vec: Vec<(String, String, Vec<f32>)> = if let Some(name) = collection.as_ref() {
+        stmt.query_map(params![name], |row| {
+            let path: String = row.get(0)?;
+            let chunk: String = row.get(1)?;
+            let emb_json: String = row.get(2)?;
+            let emb: Vec<f32> = serde_json::from_str(&emb_json).unwrap_or_default();
+            Ok((path, chunk, emb))
+        })?.filter_map(|r| r.ok()).collect()
+    } else {
+        stmt.query_map([], |row| {
+            let path: String = row.get(0)?;
+            let chunk: String = row.get(1)?;
+            let emb_json: String = row.get(2)?;
+            let emb: Vec<f32> = serde_json::from_str(&emb_json).unwrap_or_default();
+            Ok((path, chunk, emb))
+        })?.filter_map(|r| r.ok()).collect()
+    };
 
     let mut results: Vec<VectorResult> = Vec::new();
-    for row in rows {
-        let (path, chunk, emb) = row?;
+    for (path, chunk, emb) in rows_vec {
         let score = cosine_sim(&qemb, &emb);
         results.push(VectorResult { path, score, chunk });
     }
@@ -817,9 +960,9 @@ fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool) -> R
     Ok(())
 }
 
-fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_limit: usize, vec_limit: usize, json_out: bool) -> Result<()> {
-    let bm25 = bm25_search(index_dir, query, bm25_limit)?;
-    let vec = embed_search_results(index_dir, query, vec_limit)?;
+fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_limit: usize, vec_limit: usize, json_out: bool, collection: Option<String>) -> Result<()> {
+    let bm25 = bm25_search(index_dir, query, bm25_limit, collection.clone())?;
+    let vec = embed_search_results(index_dir, query, vec_limit, collection.clone())?;
 
     let mut scores: HashMap<String, f32> = HashMap::new();
 
@@ -848,7 +991,7 @@ fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_li
     Ok(())
 }
 
-fn bm25_search(index_dir: &str, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+fn bm25_search(index_dir: &str, query: &str, limit: usize, collection: Option<String>) -> Result<Vec<SearchResult>> {
     let index = Index::open_in_dir(index_dir)
         .with_context(|| format!("Index not found: {index_dir}"))?;
     let reader = index.reader()?;
@@ -859,10 +1002,18 @@ fn bm25_search(index_dir: &str, query: &str, limit: usize) -> Result<Vec<SearchR
     let title_field = schema.get_field("title").unwrap();
     let content_field = schema.get_field("content").unwrap();
     let tags_field = schema.get_field("tags").unwrap();
+    let collection_field = schema.get_field("collection").unwrap();
 
     let query_parser = QueryParser::for_index(&index, vec![title_field, content_field, tags_field]);
     let q = query_parser.parse_query(query)?;
-    let top_docs = searcher.search(&q, &TopDocs::with_limit(limit))?;
+    let top_docs = if let Some(name) = collection {
+        let term = Term::from_field_text(collection_field, &name);
+        let filter = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+        let combined = tantivy::query::BooleanQuery::intersection(vec![Box::new(q), Box::new(filter)]);
+        searcher.search(&combined, &TopDocs::with_limit(limit))?
+    } else {
+        searcher.search(&q, &TopDocs::with_limit(limit))?
+    };
 
     let mut results = Vec::new();
     for (score, doc_address) in top_docs {
@@ -882,23 +1033,36 @@ fn bm25_search(index_dir: &str, query: &str, limit: usize) -> Result<Vec<SearchR
     Ok(results)
 }
 
-fn embed_search_results(index_dir: &str, query: &str, limit: usize) -> Result<Vec<VectorResult>> {
+fn embed_search_results(index_dir: &str, query: &str, limit: usize, collection: Option<String>) -> Result<Vec<VectorResult>> {
     let db_path = Path::new(index_dir).join("embeddings.db");
     let conn = Connection::open(db_path)?;
     let qemb = hash_embedding(query, 256);
 
-    let mut stmt = conn.prepare("SELECT path, chunk, embedding FROM chunks")?;
-    let rows = stmt.query_map([], |row| {
-        let path: String = row.get(0)?;
-        let chunk: String = row.get(1)?;
-        let emb_json: String = row.get(2)?;
-        let emb: Vec<f32> = serde_json::from_str(&emb_json).unwrap_or_default();
-        Ok((path, chunk, emb))
-    })?;
+    let mut stmt = if collection.is_some() {
+        conn.prepare("SELECT path, chunk, embedding FROM chunks WHERE collection = ?1")?
+    } else {
+        conn.prepare("SELECT path, chunk, embedding FROM chunks")?
+    };
+    let rows_vec: Vec<(String, String, Vec<f32>)> = if let Some(name) = collection.as_ref() {
+        stmt.query_map(params![name], |row| {
+            let path: String = row.get(0)?;
+            let chunk: String = row.get(1)?;
+            let emb_json: String = row.get(2)?;
+            let emb: Vec<f32> = serde_json::from_str(&emb_json).unwrap_or_default();
+            Ok((path, chunk, emb))
+        })?.filter_map(|r| r.ok()).collect()
+    } else {
+        stmt.query_map([], |row| {
+            let path: String = row.get(0)?;
+            let chunk: String = row.get(1)?;
+            let emb_json: String = row.get(2)?;
+            let emb: Vec<f32> = serde_json::from_str(&emb_json).unwrap_or_default();
+            Ok((path, chunk, emb))
+        })?.filter_map(|r| r.ok()).collect()
+    };
 
     let mut results: Vec<VectorResult> = Vec::new();
-    for row in rows {
-        let (path, chunk, emb) = row?;
+    for (path, chunk, emb) in rows_vec {
         let score = cosine_sim(&qemb, &emb);
         results.push(VectorResult { path, score, chunk });
     }
@@ -974,8 +1138,8 @@ fn note_create(vault: &str, rel_path: &str, content: Option<String>, stdin: bool
     fs::write(&full_path, body)?;
 
     if reindex {
-        build_index(vault, index_dir, true)?;
-        embed_index(vault, index_dir, max_chars, overlap, true)?;
+        build_index(vault, index_dir, true, None)?;
+        embed_index(vault, index_dir, max_chars, overlap, true, None)?;
     }
 
     let out = json_response(json!({
@@ -1005,8 +1169,8 @@ fn note_append(vault: &str, rel_path: &str, content: Option<String>, stdin: bool
     fs::write(&full_path, merged)?;
 
     if reindex {
-        build_index(vault, index_dir, true)?;
-        embed_index(vault, index_dir, max_chars, overlap, true)?;
+        build_index(vault, index_dir, true, None)?;
+        embed_index(vault, index_dir, max_chars, overlap, true, None)?;
     }
 
     let out = json_response(json!({
@@ -1043,6 +1207,7 @@ fn stats(index_dir: &str, json_out: bool) -> Result<()> {
 
 struct SchemaFields {
     path: Field,
+    collection: Field,
     title: Field,
     content: Field,
     tags: Field,
@@ -1057,6 +1222,7 @@ fn schema_fields(index: &Index) -> SchemaFields {
     let schema = index.schema();
     SchemaFields {
         path: schema.get_field("path").unwrap(),
+        collection: schema.get_field("collection").unwrap(),
         title: schema.get_field("title").unwrap(),
         content: schema.get_field("content").unwrap(),
         tags: schema.get_field("tags").unwrap(),
@@ -1068,7 +1234,7 @@ fn schema_fields(index: &Index) -> SchemaFields {
     }
 }
 
-fn scan_vault(vault: &Path) -> Result<Vec<NoteDoc>> {
+fn scan_vault(vault: &Path, collection_name: &str) -> Result<Vec<NoteDoc>> {
     let mut docs = Vec::new();
     for entry in WalkDir::new(vault).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -1085,6 +1251,7 @@ fn scan_vault(vault: &Path) -> Result<Vec<NoteDoc>> {
             let parsed = parse_note(path, &content);
             docs.push(NoteDoc {
                 path: path.to_string_lossy().to_string(),
+                collection: collection_name.to_string(),
                 title: parsed.title,
                 content: parsed.content,
                 tags: parsed.tags,
