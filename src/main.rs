@@ -61,6 +61,12 @@ enum Commands {
         json: bool,
         #[arg(long)]
         collection: Option<String>,
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f32,
+        #[arg(long, default_value_t = false)]
+        files: bool,
+        #[arg(long, default_value_t = false)]
+        all: bool,
     },
     /// Get a note by path
     Get {
@@ -137,6 +143,12 @@ enum Commands {
         json: bool,
         #[arg(long)]
         collection: Option<String>,
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f32,
+        #[arg(long, default_value_t = false)]
+        files: bool,
+        #[arg(long, default_value_t = false)]
+        all: bool,
     },
     /// Hybrid search (BM25 + Vector) with RRF
     Hybrid {
@@ -156,6 +168,12 @@ enum Commands {
         json: bool,
         #[arg(long)]
         collection: Option<String>,
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f32,
+        #[arg(long, default_value_t = false)]
+        files: bool,
+        #[arg(long, default_value_t = false)]
+        all: bool,
     },
     /// Create a note (optionally from stdin)
     NoteCreate {
@@ -296,7 +314,10 @@ fn main() -> Result<()> {
             limit,
             json,
             collection,
-        } => search_index(&index, &query, limit, json, collection),
+            min_score,
+            files,
+            all,
+        } => search_index(&index, &query, limit, json, collection, min_score, files, all),
         Commands::Get {
             path,
             index,
@@ -316,8 +337,8 @@ fn main() -> Result<()> {
             incremental,
             collection,
         } => embed_index(&vault, &index, max_chars, overlap, incremental, collection),
-        Commands::EmbedSearch { query, index, limit, json, collection } => embed_search(&index, &query, limit, json, collection),
-        Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json, collection } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json, collection),
+        Commands::EmbedSearch { query, index, limit, json, collection, min_score, files, all } => embed_search(&index, &query, limit, json, collection, min_score, files, all),
+        Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json, collection, min_score, files, all } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json, collection, min_score, files, all),
         Commands::NoteCreate { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_create(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
         Commands::NoteAppend { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_append(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
         Commands::MultiGet { paths, glob, index, json, collection } => multi_get(&index, paths, glob, json, collection),
@@ -539,7 +560,7 @@ fn build_index(vault: &str, index_dir: &str, incremental: bool, collection: Opti
     Ok(())
 }
 
-fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool, collection: Option<String>) -> Result<()> {
+fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool, collection: Option<String>, min_score: f32, files: bool, all: bool) -> Result<()> {
     let index = Index::open_in_dir(index_dir)
         .with_context(|| format!("Index not found: {index_dir}"))?;
     let reader = index.reader()?;
@@ -555,6 +576,7 @@ fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool, coll
 
     let query_parser = QueryParser::for_index(&index, vec![title_field, content_field, tags_field]);
     let q = query_parser.parse_query(query)?;
+    let limit = if all { 10_000 } else { limit };
     let top_docs = if let Some(name) = collection {
         let term = Term::from_field_text(collection_field, &name);
         let filter = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
@@ -566,6 +588,9 @@ fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool, coll
 
     let mut results = Vec::new();
     for (score, doc_address) in top_docs {
+        if score < min_score {
+            continue;
+        }
         let retrieved: TantivyDocument = searcher.doc(doc_address)?;
         let path = retrieved
             .get_first(path_field)
@@ -586,11 +611,17 @@ fn search_index(index_dir: &str, query: &str, limit: usize, json_out: bool, coll
     }
 
     if json_out {
-        let out = json_response(json!({
-            "query": query,
-            "results": results
-        }));
-        println!("{out}");
+        if files {
+            let files_out: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+            let out = json_response(json!({"query": query, "files": files_out}));
+            println!("{out}");
+        } else {
+            let out = json_response(json!({
+                "query": query,
+                "results": results
+            }));
+            println!("{out}");
+        }
     } else {
         for r in results {
             println!("{}\t{}\t{:.2}", r.path, r.title, r.score);
@@ -955,7 +986,7 @@ fn embed_index(
     Ok(())
 }
 
-fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool, collection: Option<String>) -> Result<()> {
+fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool, collection: Option<String>, min_score: f32, files: bool, all: bool) -> Result<()> {
     let db_path = Path::new(index_dir).join("embeddings.db");
     let conn = Connection::open(db_path)?;
     let qemb = hash_embedding(query, 256);
@@ -990,11 +1021,19 @@ fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool, coll
     }
 
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    let limit = if all { 10_000 } else { limit };
+    results.retain(|r| r.score >= min_score);
     results.truncate(limit);
 
     if json_out {
-        let out = json_response(json!({ "query": query, "results": results }));
-        println!("{out}");
+        if files {
+            let files_out: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+            let out = json_response(json!({ "query": query, "files": files_out }));
+            println!("{out}");
+        } else {
+            let out = json_response(json!({ "query": query, "results": results }));
+            println!("{out}");
+        }
     } else {
         for r in results {
             println!("{}	{:.3}	{}", r.path, r.score, r.chunk);
@@ -1003,7 +1042,7 @@ fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool, coll
     Ok(())
 }
 
-fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_limit: usize, vec_limit: usize, json_out: bool, collection: Option<String>) -> Result<()> {
+fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_limit: usize, vec_limit: usize, json_out: bool, collection: Option<String>, min_score: f32, files: bool, all: bool) -> Result<()> {
     let bm25 = bm25_search(index_dir, query, bm25_limit, collection.clone())?;
     let vec = embed_search_results(index_dir, query, vec_limit, collection.clone())?;
 
@@ -1020,11 +1059,19 @@ fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_li
 
     let mut fused: Vec<(String, f32)> = scores.into_iter().collect();
     fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let limit = if all { 10_000 } else { limit };
+    fused.retain(|(_, score)| *score >= min_score);
     fused.truncate(limit);
 
     if json_out {
-        let out = json_response(json!({ "query": query, "results": fused }));
-        println!("{out}");
+        if files {
+            let files_out: Vec<String> = fused.iter().map(|(p, _)| p.clone()).collect();
+            let out = json_response(json!({ "query": query, "files": files_out }));
+            println!("{out}");
+        } else {
+            let out = json_response(json!({ "query": query, "results": fused }));
+            println!("{out}");
+        }
     } else {
         for (path, score) in fused {
             println!("{}	{:.4}", path, score);
