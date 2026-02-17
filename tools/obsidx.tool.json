@@ -15,7 +15,7 @@
     "note-append": "obsidx note-append --vault <path> --path <rel.md> [--content <text>|--stdin] [--reindex]",
     "embed-index": "obsidx embed-index --vault <path> --index <path> --incremental [--collection <name>]",
     "embed-search": "obsidx embed-search --index <path> --query <q> --json [--collection <name>] [--min-score <f>] [--files] [--all]",
-    "hybrid": "obsidx hybrid --index <path> --query <q> --json [--collection <name>] [--min-score <f>] [--files] [--all]",
+    "hybrid": "obsidx hybrid --index <path> --query <q> --json [--collection <name>] [--min-score <f>] [--files] [--all] [--expand <n>]",
     "collection-add": "obsidx collection-add --name <name> --path <path>",
     "collection-list": "obsidx collection-list",
     "collection-remove": "obsidx collection-remove --name <name>",

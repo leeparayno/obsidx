@@ -175,6 +175,8 @@ enum Commands {
         files: bool,
         #[arg(long, default_value_t = false)]
         all: bool,
+        #[arg(long, default_value_t = 2)]
+        expand: u32,
     },
     /// Create a note (optionally from stdin)
     NoteCreate {
@@ -341,7 +343,7 @@ fn main() -> Result<()> {
             collection,
         } => embed_index(&vault, &index, max_chars, overlap, incremental, collection),
         Commands::EmbedSearch { query, index, limit, json, collection, min_score, files, all } => embed_search(&index, &query, limit, json, collection, min_score, files, all),
-        Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json, collection, min_score, files, all } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json, collection, min_score, files, all),
+        Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json, collection, min_score, files, all, expand } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json, collection, min_score, files, all, expand),
         Commands::NoteCreate { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_create(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
         Commands::NoteAppend { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_append(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
         Commands::MultiGet { paths, glob, index, json, collection } => multi_get(&index, paths, glob, json, collection),
@@ -1046,19 +1048,33 @@ fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool, coll
     Ok(())
 }
 
-fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_limit: usize, vec_limit: usize, json_out: bool, collection: Option<String>, min_score: f32, files: bool, all: bool) -> Result<()> {
-    let bm25 = bm25_search(index_dir, query, bm25_limit, collection.clone())?;
-    let vec = embed_search_results(index_dir, query, vec_limit, collection.clone())?;
-
+fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_limit: usize, vec_limit: usize, json_out: bool, collection: Option<String>, min_score: f32, files: bool, all: bool, expand: u32) -> Result<()> {
     let mut scores: HashMap<String, f32> = HashMap::new();
 
+    // Original query (bonus)
+    let bm25 = bm25_search(index_dir, query, bm25_limit, collection.clone())?;
+    let vec = embed_search_results(index_dir, query, vec_limit, collection.clone())?;
     for (rank, item) in bm25.iter().enumerate() {
         let r = (rrf_k + (rank as u32) + 1) as f32;
-        *scores.entry(item.path.clone()).or_insert(0.0) += 1.0 / r;
+        *scores.entry(item.path.clone()).or_insert(0.0) += 2.0 * (1.0 / r);
     }
     for (rank, item) in vec.iter().enumerate() {
         let r = (rrf_k + (rank as u32) + 1) as f32;
-        *scores.entry(item.path.clone()).or_insert(0.0) += 1.0 / r;
+        *scores.entry(item.path.clone()).or_insert(0.0) += 2.0 * (1.0 / r);
+    }
+
+    // Expanded queries
+    for qx in expand_query(query, expand) {
+        let bm25x = bm25_search(index_dir, &qx, bm25_limit, collection.clone())?;
+        let vecx = embed_search_results(index_dir, &qx, vec_limit, collection.clone())?;
+        for (rank, item) in bm25x.iter().enumerate() {
+            let r = (rrf_k + (rank as u32) + 1) as f32;
+            *scores.entry(item.path.clone()).or_insert(0.0) += 1.0 / r;
+        }
+        for (rank, item) in vecx.iter().enumerate() {
+            let r = (rrf_k + (rank as u32) + 1) as f32;
+            *scores.entry(item.path.clone()).or_insert(0.0) += 1.0 / r;
+        }
     }
 
     let mut fused: Vec<(String, f32)> = scores.into_iter().collect();
@@ -1083,6 +1099,22 @@ fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_li
     }
 
     Ok(())
+}
+
+
+fn expand_query(query: &str, n: u32) -> Vec<String> {
+    if n == 0 { return vec![]; }
+    let mut variants = Vec::new();
+    let stop = ["the","a","an","and","or","to","of","in","on","for","with","is","are","be","by"];
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    let filtered: Vec<&str> = tokens.iter().copied().filter(|t| !stop.contains(&t.to_lowercase().as_str())).collect();
+    if !filtered.is_empty() {
+        variants.push(filtered.join(" "));
+    }
+    variants.push(format!("\"{}\"", query));
+    variants.retain(|v| v.trim() != query);
+    variants.truncate(n as usize);
+    variants
 }
 
 fn bm25_search(index_dir: &str, query: &str, limit: usize, collection: Option<String>) -> Result<Vec<SearchResult>> {
@@ -1406,7 +1438,8 @@ fn mcp_server() -> Result<()> {
                 let min_score = args.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 let files = args.get("files").and_then(|v| v.as_bool()).unwrap_or(false);
                 let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
-                hybrid_search(index, query, limit, rrf_k, bm25_limit, vec_limit, true, collection, min_score, files, all)
+                let expand = args.get("expand").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
+                hybrid_search(index, query, limit, rrf_k, bm25_limit, vec_limit, true, collection, min_score, files, all, expand)
             }
             "get" => {
                 let index = args.get("index").and_then(|v| v.as_str()).unwrap_or("./.obsidx");
