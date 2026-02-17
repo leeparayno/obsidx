@@ -16,7 +16,7 @@ tantivy = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 notify = "6"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "load_extension"] }
 toml = "0.8"
 glob = "0.3"
 
