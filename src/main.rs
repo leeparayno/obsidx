@@ -131,6 +131,10 @@ enum Commands {
         incremental: bool,
         #[arg(long)]
         collection: Option<String>,
+        #[arg(long, value_enum, default_value_t = EmbeddingBackend::Hash)]
+        embed_backend: EmbeddingBackend,
+        #[arg(long)]
+        embed_model: Option<String>,
     },
     /// Vector search over embeddings
     EmbedSearch {
@@ -150,6 +154,10 @@ enum Commands {
         files: bool,
         #[arg(long, default_value_t = false)]
         all: bool,
+        #[arg(long, value_enum, default_value_t = EmbeddingBackend::Hash)]
+        embed_backend: EmbeddingBackend,
+        #[arg(long)]
+        embed_model: Option<String>,
     },
     /// Hybrid search (BM25 + Vector) with RRF
     Hybrid {
@@ -177,6 +185,10 @@ enum Commands {
         all: bool,
         #[arg(long, default_value_t = 2)]
         expand: u32,
+        #[arg(long, value_enum, default_value_t = EmbeddingBackend::Hash)]
+        embed_backend: EmbeddingBackend,
+        #[arg(long)]
+        embed_model: Option<String>,
     },
     /// Create a note (optionally from stdin)
     NoteCreate {
@@ -270,6 +282,12 @@ struct SearchResult {
     doc_id: String,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum EmbeddingBackend {
+    Hash,
+    Ort,
+}
+
 #[derive(Debug, Serialize)]
 struct TagCount {
     tag: String,
@@ -341,9 +359,11 @@ fn main() -> Result<()> {
             overlap,
             incremental,
             collection,
-        } => embed_index(&vault, &index, max_chars, overlap, incremental, collection),
-        Commands::EmbedSearch { query, index, limit, json, collection, min_score, files, all } => embed_search(&index, &query, limit, json, collection, min_score, files, all),
-        Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json, collection, min_score, files, all, expand } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json, collection, min_score, files, all, expand),
+            embed_backend,
+            embed_model,
+        } => embed_index(&vault, &index, max_chars, overlap, incremental, collection, embed_backend, embed_model.as_deref()),
+        Commands::EmbedSearch { query, index, limit, json, collection, min_score, files, all, embed_backend, embed_model } => embed_search(&index, &query, limit, json, collection, min_score, files, all, embed_backend, embed_model.as_deref()),
+        Commands::Hybrid { query, index, limit, rrf_k, bm25_limit, vec_limit, json, collection, min_score, files, all, expand, embed_backend, embed_model } => hybrid_search(&index, &query, limit, rrf_k, bm25_limit, vec_limit, json, collection, min_score, files, all, expand, embed_backend, embed_model.as_deref()),
         Commands::NoteCreate { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_create(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
         Commands::NoteAppend { vault, path, content, stdin, reindex, index, max_chars, overlap } => note_append(&vault, &path, content, stdin, reindex, &index, max_chars, overlap),
         Commands::MultiGet { paths, glob, index, json, collection } => multi_get(&index, paths, glob, json, collection),
@@ -905,6 +925,8 @@ fn embed_index(
     overlap: usize,
     incremental: bool,
     collection: Option<String>,
+    embed_backend: EmbeddingBackend,
+    embed_model: Option<&str>,
 ) -> Result<()> {
     fs::create_dir_all(index_dir).ok();
     let db_path = Path::new(index_dir).join("embeddings.db");
@@ -964,7 +986,7 @@ fn embed_index(
         let chunks = chunk_text(&doc.content, max_chars, overlap);
         for ch in chunks {
             let hash = hash_str(&ch);
-            let emb = hash_embedding(&ch, 256);
+            let emb = embed_text(&ch, embed_backend.clone(), 256, embed_model)?;
             let emb_json = serde_json::to_string(&emb).unwrap_or_else(|_| "[]".to_string());
             conn.execute(
                 "INSERT INTO chunks (path, collection, chunk, chunk_hash, mtime, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -992,10 +1014,10 @@ fn embed_index(
     Ok(())
 }
 
-fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool, collection: Option<String>, min_score: f32, files: bool, all: bool) -> Result<()> {
+fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool, collection: Option<String>, min_score: f32, files: bool, all: bool, embed_backend: EmbeddingBackend, embed_model: Option<&str>) -> Result<()> {
     let db_path = Path::new(index_dir).join("embeddings.db");
     let conn = Connection::open(db_path)?;
-    let qemb = hash_embedding(query, 256);
+    let qemb = embed_text(query, embed_backend, 256, embed_model)?;
 
     let mut stmt = if collection.is_some() {
         conn.prepare("SELECT path, chunk, embedding FROM chunks WHERE collection = ?1")?
@@ -1048,12 +1070,12 @@ fn embed_search(index_dir: &str, query: &str, limit: usize, json_out: bool, coll
     Ok(())
 }
 
-fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_limit: usize, vec_limit: usize, json_out: bool, collection: Option<String>, min_score: f32, files: bool, all: bool, expand: u32) -> Result<()> {
+fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_limit: usize, vec_limit: usize, json_out: bool, collection: Option<String>, min_score: f32, files: bool, all: bool, expand: u32, embed_backend: EmbeddingBackend, embed_model: Option<&str>) -> Result<()> {
     let mut scores: HashMap<String, f32> = HashMap::new();
 
     // Original query (bonus)
     let bm25 = bm25_search(index_dir, query, bm25_limit, collection.clone())?;
-    let vec = embed_search_results(index_dir, query, vec_limit, collection.clone())?;
+    let vec = embed_search_results(index_dir, query, vec_limit, collection.clone(), embed_backend.clone(), embed_model)?;
     for (rank, item) in bm25.iter().enumerate() {
         let r = (rrf_k + (rank as u32) + 1) as f32;
         *scores.entry(item.path.clone()).or_insert(0.0) += 2.0 * (1.0 / r);
@@ -1066,7 +1088,7 @@ fn hybrid_search(index_dir: &str, query: &str, limit: usize, rrf_k: u32, bm25_li
     // Expanded queries
     for qx in expand_query(query, expand) {
         let bm25x = bm25_search(index_dir, &qx, bm25_limit, collection.clone())?;
-        let vecx = embed_search_results(index_dir, &qx, vec_limit, collection.clone())?;
+        let vecx = embed_search_results(index_dir, &qx, vec_limit, collection.clone(), embed_backend.clone(), embed_model)?;
         for (rank, item) in bm25x.iter().enumerate() {
             let r = (rrf_k + (rank as u32) + 1) as f32;
             *scores.entry(item.path.clone()).or_insert(0.0) += 1.0 / r;
@@ -1165,10 +1187,10 @@ fn bm25_search(index_dir: &str, query: &str, limit: usize, collection: Option<St
     Ok(results)
 }
 
-fn embed_search_results(index_dir: &str, query: &str, limit: usize, collection: Option<String>) -> Result<Vec<VectorResult>> {
+fn embed_search_results(index_dir: &str, query: &str, limit: usize, collection: Option<String>, embed_backend: EmbeddingBackend, embed_model: Option<&str>) -> Result<Vec<VectorResult>> {
     let db_path = Path::new(index_dir).join("embeddings.db");
     let conn = Connection::open(db_path)?;
-    let qemb = hash_embedding(query, 256);
+    let qemb = embed_text(query, embed_backend, 256, embed_model)?;
 
     let mut stmt = if collection.is_some() {
         conn.prepare("SELECT path, chunk, embedding FROM chunks WHERE collection = ?1")?
@@ -1218,6 +1240,18 @@ fn chunk_text(text: &str, max_chars: usize, overlap: usize) -> Vec<String> {
         start = end.saturating_sub(overlap);
     }
     chunks
+}
+
+fn embed_text(text: &str, backend: EmbeddingBackend, dims: usize, model_path: Option<&str>) -> Result<Vec<f32>> {
+    match backend {
+        EmbeddingBackend::Hash => Ok(hash_embedding(text, dims)),
+        EmbeddingBackend::Ort => {
+            let model = model_path.ok_or_else(|| anyhow::anyhow!("ORT backend requires --embed-model"))?;
+            // TODO: Load ONNX model + tokenizer and produce real embeddings.
+            let _ = model;
+            Err(anyhow::anyhow!("ORT backend not yet wired (model path provided)"))
+        }
+    }
 }
 
 fn hash_embedding(text: &str, dims: usize) -> Vec<f32> {
@@ -1271,7 +1305,7 @@ fn note_create(vault: &str, rel_path: &str, content: Option<String>, stdin: bool
 
     if reindex {
         build_index(vault, index_dir, true, None)?;
-        embed_index(vault, index_dir, max_chars, overlap, true, None)?;
+        embed_index(vault, index_dir, max_chars, overlap, true, None, EmbeddingBackend::Hash, None)?;
     }
 
     let out = json_response(json!({
@@ -1302,7 +1336,7 @@ fn note_append(vault: &str, rel_path: &str, content: Option<String>, stdin: bool
 
     if reindex {
         build_index(vault, index_dir, true, None)?;
-        embed_index(vault, index_dir, max_chars, overlap, true, None)?;
+        embed_index(vault, index_dir, max_chars, overlap, true, None, EmbeddingBackend::Hash, None)?;
     }
 
     let out = json_response(json!({
@@ -1425,7 +1459,7 @@ fn mcp_server() -> Result<()> {
                 let min_score = args.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 let files = args.get("files").and_then(|v| v.as_bool()).unwrap_or(false);
                 let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
-                embed_search(index, query, limit, true, collection, min_score, files, all)
+                embed_search(index, query, limit, true, collection, min_score, files, all, EmbeddingBackend::Hash, None)
             }
             "hybrid" => {
                 let index = args.get("index").and_then(|v| v.as_str()).unwrap_or("./.obsidx");
@@ -1439,7 +1473,7 @@ fn mcp_server() -> Result<()> {
                 let files = args.get("files").and_then(|v| v.as_bool()).unwrap_or(false);
                 let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
                 let expand = args.get("expand").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
-                hybrid_search(index, query, limit, rrf_k, bm25_limit, vec_limit, true, collection, min_score, files, all, expand)
+                hybrid_search(index, query, limit, rrf_k, bm25_limit, vec_limit, true, collection, min_score, files, all, expand, EmbeddingBackend::Hash, None)
             }
             "get" => {
                 let index = args.get("index").and_then(|v| v.as_str()).unwrap_or("./.obsidx");
